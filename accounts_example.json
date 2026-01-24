@@ -1,0 +1,10 @@
+[
+    {
+        "privateKey": "0xYOUR_PRIVATE_KEY_HERE",
+        "proxy": "http://user:pass@ip:port"
+    },
+    {
+        "privateKey": "0xANOTHER_PRIVATE_KEY",
+        "proxy": null
+    }
+]

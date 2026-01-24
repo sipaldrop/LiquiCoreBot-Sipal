@@ -1,0 +1,10 @@
+node_modules/
+.env
+accounts.json
+wallet_db.json
+*.har
+*.log
+.DS_Store
+credential/
+accounts_tmp.json
+config_tmp.json
