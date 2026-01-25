@@ -72,11 +72,13 @@ Kamu perlu membuat file untuk menyimpan data akunmu.
 [
   {
     "privateKey": "PRIVATE_KEY_METAMASK_MU",
-    "proxy": "http://user:pass@ip:port"
+    "proxy": "http://user:pass@ip:port",
+    "discordToken": "YOUR_DISCORD_TOKEN_HERE"
   },
   {
     "privateKey": "PRIVATE_KEY_AKUN_KEDUA",
-    "proxy": null
+    "proxy": null,
+    "discordToken": "YOUR_DISCORD_TOKEN_HERE"
   }
 ]
 ```
