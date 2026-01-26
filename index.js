@@ -6,7 +6,10 @@ const Table = require('cli-table3');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const UserAgent = require('user-agents');
 const moment = require('moment');
-const path = require('path');
+
+// ============================================
+// SIPAL LIQUICORE BOT V3.0 - REALTIME DASHBOARD
+// ============================================
 
 // --- CONFIG & SETUP ---
 const config = {
@@ -14,84 +17,201 @@ const config = {
     origin: "https://liquicore.finance",
     referer: "https://liquicore.finance/",
     apiKey: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZja3FubWVodWVicW1ldmtpY2d6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njg4NzQ3NDksImV4cCI6MjA4NDQ1MDc0OX0.ryCrP8GkL68ORKerfisZ6kfmFjTcyl3UJx7S6cfHhmk",
-    retries: 3,
-    delayMin: 5000,
-    delayMax: 15000
+    maxRetries: 5,
+    retryDelay: 3000,
+
+    // SCHEDULE CONFIG
+    dailyHour: 14,        // 14:00 WIB (2 PM)
+    dailyMinute: 0,
+    discordInterval: 30 * 60 * 1000, // 30 minutes
+    duelInterval: 3 * 60 * 60 * 1000, // 3 hours
+
+
+    // DISCORD CONFIG
+    discordGuildId: "1460573383518322770",
+    discordAppId: "1463169413485428747",
+    faucets: [
+        { name: "USDC", channelId: "1463389945225023629", customId: "claim_tusdc" },
+        { name: "USDT", channelId: "1463389902170492961", customId: "claim_tusdt" }
+    ]
 };
 
+// --- ANTI-DETECTION CONFIG ---
+const antiDetect = {
+    minActionDelay: 2000,
+    maxActionDelay: 8000,
+    requestJitter: () => Math.floor(Math.random() * 2000) + 500,
+    interactionDelay: () => Math.floor(Math.random() * 3000) + 1000,
+    userAgents: [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15'
+    ],
+    getRandomUA: function () {
+        return this.userAgents[Math.floor(Math.random() * this.userAgents.length)];
+    },
+    generateSessionId: () => {
+        const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+        let result = '';
+        for (let i = 0; i < 32; i++) result += chars[Math.floor(Math.random() * chars.length)];
+        return result;
+    }
+};
+
+// Load accounts
 let accounts = [];
 try {
     accounts = require('./accounts.json');
 } catch (e) {
-    console.log(chalk.red('Error loading accounts.json.'));
+    console.log(chalk.red('❌ Error loading accounts.json'));
     process.exit(1);
 }
 
-const provider = new ethers.providers.JsonRpcProvider('https://data-seed-prebsc-1-s1.bnbchain.org:8545/');
+// Provider with failover
+const RPC_URLS = [
+    'https://data-seed-prebsc-1-s1.bnbchain.org:8545/',
+    'https://data-seed-prebsc-2-s1.bnbchain.org:8545/',
+    'https://bsc-testnet-rpc.publicnode.com'
+];
+let currentRpcIndex = 0;
+let provider = new ethers.providers.JsonRpcProvider(RPC_URLS[currentRpcIndex]);
+
+function rotateRpc() {
+    currentRpcIndex = (currentRpcIndex + 1) % RPC_URLS.length;
+    provider = new ethers.providers.JsonRpcProvider(RPC_URLS[currentRpcIndex]);
+}
 
 // Contracts
 const USDC_ADDR = '0xe4da02B0188D98A10244c1bD265Ea0aF36be205a';
 const USDT_ADDR = '0x29565d182bF1796a3836a68D22D833d92795725A';
 const VAULT_ADDR = '0x11e4e6cD5D9E60646219098d99CfaFd130cdcE93';
+const DUEL_ADDR = '0xc77bcFc8F258b69655A34000213B3cBBC35ae0cA';
 
-// Utils
+// DUEL ABI
+const DUEL_ABI = [
+    'function createDuel(uint256 wagerAmount, address wagerToken, uint8 duelType) returns (uint256)',
+    'function acceptDuel(uint256 duelId)',
+    'function claimPrize(uint256 duelId)',
+    'function duels(uint256) view returns (uint256 id, address challenger, address opponent, uint256 wagerAmount, address wagerToken, uint8 duelType, uint8 status, uint256 createdAt, uint256 expiresAt, address winner, bool prizeClaimed)',
+    'function duelCounter() view returns (uint256)',
+    'function getOpenDuels() view returns (tuple(uint256 id, address challenger, address opponent, uint256 wagerAmount, address wagerToken, uint8 duelType, uint8 status, uint256 createdAt, uint256 expiresAt, address winner, bool prizeClaimed)[])',
+    'function getActiveDuels() view returns (tuple(uint256 id, address challenger, address opponent, uint256 wagerAmount, address wagerToken, uint8 duelType, uint8 status, uint256 createdAt, uint256 expiresAt, address winner, bool prizeClaimed)[])',
+    'function getUserDuels(address user) view returns (uint256[])',
+    'function getDuel(uint256 duelId) view returns (tuple(uint256 id, address challenger, address opponent, uint256 wagerAmount, address wagerToken, uint8 duelType, uint8 status, uint256 createdAt, uint256 expiresAt, address winner, bool prizeClaimed))'
+];
+
+const DUEL_STATUS = { PENDING: 0, ACTIVE: 1, RESOLVED: 2, CLAIMED: 3, CANCELLED: 4 };
+
+// ============================================
+// GLOBAL STATE & ERROR LOG
+// ============================================
+
+const errorLogs = [];
+const MAX_ERROR_LOGS = 10;
+const state = {};
+
+const createState = (index) => ({
+    name: `Acc ${index + 1}`,
+    points: '-',
+    streak: '-',
+    discordFaucet: '⏳',
+    webFaucet: '⏳',
+    dailyTask: '⏳',
+    dailyQuiz: '⏳',
+    duelStatus: '⏳',
+    nextDaily: null,
+    nextDuel: null,
+    lastDiscord: 0,
+    lastDaily: 0,
+    lastDuel: 0,
+    isProcessing: false
+});
+
+// ============================================
+// UTILITY FUNCTIONS
+// ============================================
+
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const randomDelay = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
-
-// --- SCHEDULER HELPERS ---
-function getNextScheduledTime(hour = 12, minute = 0) {
-    const now = new Date();
-    const next = new Date(now);
-    next.setHours(hour, minute, 0, 0);
-    if (now >= next) {
-        next.setDate(next.getDate() + 1);
-    }
-    return next;
-}
+const randomSleep = async () => await sleep(randomDelay(antiDetect.minActionDelay, antiDetect.maxActionDelay));
 
 function formatTime(ms) {
+    if (ms <= 0) return chalk.green("Ready");
     const totalSeconds = Math.floor(ms / 1000);
     const hours = Math.floor(totalSeconds / 3600);
     const minutes = Math.floor((totalSeconds % 3600) / 60);
     const seconds = totalSeconds % 60;
-    return `${hours.toString().padStart(2, '0')}h ${minutes.toString().padStart(2, '0')}m ${seconds.toString().padStart(2, '0')}s`;
+    if (hours > 0) return `${hours}h ${minutes}m`;
+    if (minutes > 0) return `${minutes}m ${seconds}s`;
+    return `${seconds}s`;
 }
 
-async function displayCountdown(msUntilNextRun, targetTime) {
-    // Just the countdown, NO TABLE here.
-    return new Promise((resolve) => {
-        const endTime = targetTime.getTime();
-        if (endTime <= Date.now()) { resolve(); return; }
+function getNextDailySchedule() {
+    const now = new Date();
+    const next = new Date(now);
+    next.setHours(config.dailyHour, config.dailyMinute, 0, 0);
+    if (now >= next) next.setDate(next.getDate() + 1);
+    return next;
+}
 
-        console.log(''); // spacer
-        const intervalId = setInterval(() => {
-            const remaining = endTime - Date.now();
-            if (remaining <= 0) {
-                clearInterval(intervalId);
-                process.stdout.clearLine?.();
-                process.stdout.cursorTo?.(0);
-                resolve();
-            } else {
-                try {
-                    process.stdout.clearLine?.();
-                    process.stdout.cursorTo?.(0);
-                    process.stdout.write(chalk.yellow(`⏳ Waiting for next run... ${formatTime(remaining)} remaining`));
-                } catch (e) { }
+function logError(idx, msg) {
+    const time = moment().format('HH:mm:ss');
+    const logMsg = `[${time}] [Acc ${idx + 1}] ❌ ${msg}`;
+    errorLogs.push(logMsg);
+    if (errorLogs.length > MAX_ERROR_LOGS) errorLogs.shift();
+}
+
+// ============================================
+// RETRY WRAPPER (5x with smart logic)
+// ============================================
+
+async function withRetry(fn, idx, actionName, maxRetries = config.maxRetries) {
+    let lastError;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            await sleep(antiDetect.requestJitter());
+            const result = await fn();
+            return { success: true, result };
+        } catch (error) {
+            lastError = error;
+            const errorMsg = error.message || 'Unknown error';
+
+            if (errorMsg.includes('429') || errorMsg.includes('rate limit')) {
+                const waitTime = 30000 + (attempt * 10000);
+                if (state[idx]) state[idx][actionName] = `⏳RL${attempt}`;
+                await sleep(waitTime);
+                continue;
             }
-        }, 1000);
-    });
+
+            if (errorMsg.includes('ECONNRESET') || errorMsg.includes('ETIMEDOUT') || errorMsg.includes('proxy')) {
+                rotateRpc();
+                if (state[idx]) state[idx][actionName] = `⏳R${attempt}`;
+                await sleep(config.retryDelay * attempt);
+                continue;
+            }
+
+            if (errorMsg.includes('already') || errorMsg.includes('cooldown')) {
+                return { success: true, result: 'already_done' };
+            }
+
+            if (attempt < maxRetries) {
+                if (state[idx]) state[idx][actionName] = `⏳R${attempt}`;
+                await sleep(config.retryDelay * attempt);
+            }
+        }
+    }
+
+    logError(idx, `${actionName}: ${lastError?.message?.slice(0, 50) || 'Failed after 5 retries'}`);
+    return { success: false, error: lastError };
 }
 
-async function waitUntilScheduledTime(hour = 12, minute = 0) {
-    const nextRun = getNextScheduledTime(hour, minute);
-    const msUntilNextRun = nextRun.getTime() - Date.now();
-    await displayCountdown(msUntilNextRun, nextRun);
-}
+// ============================================
+// DISPLAY FUNCTIONS
+// ============================================
 
-// --- SIPAL UI ---
-const displayBanner = () => {
-    console.clear();
-    console.log(chalk.blue(`
+const BANNER = chalk.blue(`
                / \\
               /   \\
              |  |  |
@@ -99,281 +219,651 @@ const displayBanner = () => {
               \\  \\
              |  |  |
              |  |  |
-              \   /
-               \ /
-    `));
-    console.log(chalk.bold.cyan('    ======SIPAL AIRDROP======'));
-    console.log(chalk.bold.cyan('  =====SIPAL LIQUICORE BOT V1.0====='));
-    console.log('\n');
-};
+              \\   /
+               \\ /
+`) + chalk.bold.cyan('    ======SIPAL AIRDROP======\n') +
+    chalk.bold.cyan('  =====SIPAL LIQUICORE BOT V3.0=====\n') +
+    chalk.gray('     Realtime Dashboard Mode\n');
 
-const logHelper = (index, type, msg) => {
-    const time = moment().format('HH:mm:ss');
-    let color = chalk.white;
-    if (type === 'SUCCESS') color = chalk.green;
-    if (type === 'ERROR') color = chalk.red;
-    if (type === 'INFO') color = chalk.cyan;
-    if (type === 'WARN') color = chalk.yellow;
-    console.log(`${chalk.gray(`[${time}]`)} ${chalk.cyan(`[Acc ${index + 1}]`)} ${color(msg)}`);
-};
+function clearScreen() {
+    process.stdout.write('\x1B[2J\x1B[0f');
+}
 
-// --- CORE BLOCKCHAIN LOGIC ---
+function renderDashboard() {
+    clearScreen();
+    process.stdout.write('\x1B[1;1H');
+
+    console.log(BANNER);
+
+    if (errorLogs.length > 0) {
+        console.log(chalk.red.bold('═══ Error Logs ═══'));
+        errorLogs.forEach(log => console.log(chalk.red(log)));
+        console.log(chalk.red('═'.repeat(40)));
+        console.log('');
+    }
+
+    const table = new Table({
+        head: [
+            chalk.cyan('Account'),
+            chalk.cyan('Points'),
+            chalk.cyan('Streak'),
+            chalk.cyan('Discord'),
+            chalk.cyan('WebFaucet'),
+            chalk.cyan('DailyTask'),
+            chalk.cyan('Quiz'),
+            chalk.cyan('Duel'),
+            chalk.cyan('NextDaily'),
+            chalk.cyan('NextDuel')
+        ],
+        style: { head: [], border: ['grey'] },
+        colWidths: [10, 9, 8, 10, 11, 11, 6, 10, 12, 12]
+    });
+
+    const now = Date.now();
+
+    Object.keys(state).sort((a, b) => parseInt(a) - parseInt(b)).forEach(idx => {
+        const s = state[idx];
+        const nextDailyMs = s.nextDaily ? s.nextDaily.getTime() - now : 0;
+        const nextDuelMs = s.nextDuel ? s.nextDuel.getTime() - now : 0;
+
+        const formatStatus = (status) => {
+            if (status === '✅') return chalk.green('✅');
+            if (status === '❌') return chalk.red('❌');
+            if (status.startsWith('⏳')) return chalk.yellow(status);
+            if (status === '🔄') return chalk.cyan('🔄');
+            return status;
+        };
+
+        table.push([
+            chalk.white(s.name),
+            chalk.yellow(s.points),
+            chalk.magenta(s.streak),
+            formatStatus(s.discordFaucet),
+            formatStatus(s.webFaucet),
+            formatStatus(s.dailyTask),
+            formatStatus(s.dailyQuiz),
+            formatStatus(s.duelStatus),
+            formatTime(nextDailyMs),
+            formatTime(nextDuelMs)
+        ]);
+    });
+
+    console.log(table.toString());
+    console.log('');
+    console.log(chalk.gray(`Last Update: ${moment().format('HH:mm:ss')} | Press Ctrl+C to stop`));
+}
+
+// ============================================
+// HTTP CLIENT WITH ANTI-DETECTION
+// ============================================
+
+function createClient(proxy) {
+    const agent = proxy ? new HttpsProxyAgent(proxy) : undefined;
+    const userAgent = antiDetect.getRandomUA();
+
+    return axios.create({
+        baseURL: config.baseUrl,
+        httpsAgent: agent,
+        timeout: 30000,
+        headers: {
+            'apikey': config.apiKey,
+            'content-type': 'application/json',
+            'origin': config.origin,
+            'referer': config.referer,
+            'user-agent': userAgent,
+            'accept': 'application/json, text/plain, */*',
+            'accept-language': 'en-US,en;q=0.9',
+            'sec-ch-ua': '"Chromium";v="120", "Google Chrome";v="120"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"',
+            'sec-fetch-dest': 'empty',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-site': 'cross-site',
+            'cache-control': 'no-cache',
+            'pragma': 'no-cache'
+        }
+    });
+}
+
+function createDiscordClient(token, proxy) {
+    const agent = proxy ? new HttpsProxyAgent(proxy) : undefined;
+    return axios.create({
+        timeout: 30000,
+        httpsAgent: agent,
+        headers: {
+            'Authorization': token,
+            'Content-Type': 'application/json',
+            'User-Agent': antiDetect.getRandomUA(),
+            'X-Super-Properties': Buffer.from(JSON.stringify({
+                os: 'Windows',
+                browser: 'Chrome',
+                device: '',
+                system_locale: 'en-US',
+                browser_user_agent: antiDetect.getRandomUA(),
+                browser_version: '120.0.0.0',
+                os_version: '10',
+                referrer: '',
+                referring_domain: '',
+                referrer_current: '',
+                referring_domain_current: '',
+                release_channel: 'stable',
+                client_build_number: 250000,
+                client_event_source: null
+            })).toString('base64')
+        }
+    });
+}
+
+// ============================================
+// BLOCKCHAIN FUNCTIONS
+// ============================================
+
 async function getTokenBalance(wallet, tokenAddress) {
     try {
         const contract = new ethers.Contract(tokenAddress, ['function balanceOf(address) view returns (uint256)'], wallet);
         return await contract.balanceOf(wallet.address);
-    } catch (e) { return ethers.BigNumber.from(0); }
+    } catch { return ethers.BigNumber.from(0); }
 }
 
 async function getAllowance(wallet, tokenAddress, spender) {
     try {
         const contract = new ethers.Contract(tokenAddress, ['function allowance(address, address) view returns (uint256)'], wallet);
         return await contract.allowance(wallet.address, spender);
-    } catch (e) { return ethers.BigNumber.from(0); }
+    } catch { return ethers.BigNumber.from(0); }
 }
 
-async function ensureApproval(wallet, tokenAddress, spender, idx) {
-    const minAllowance = ethers.BigNumber.from("1000000000");
-    let attempts = 0;
-    while (attempts < 3) {
-        const allowance = await getAllowance(wallet, tokenAddress, spender);
-        if (allowance.gte(minAllowance)) {
-            if (attempts > 0) logHelper(idx, 'SUCCESS', 'Allowance Confirmed');
-            return true;
-        }
-        if (attempts === 0) {
-            logHelper(idx, 'INFO', 'Sending Approve...');
-            await approveToken(wallet, tokenAddress, spender, idx);
-        } else {
-            logHelper(idx, 'INFO', `Waiting for Allowance (Attempt ${attempts})...`);
-        }
-        await sleep(10000);
-        attempts++;
-    }
-    return false;
-}
+async function ensureApproval(wallet, tokenAddress, spender) {
+    const minAllowance = ethers.utils.parseUnits("100000", 18);
+    const allowance = await getAllowance(wallet, tokenAddress, spender);
+    if (allowance.gte(minAllowance)) return true;
 
-async function claimFaucet(wallet, tokenAddress, tokenName, idx) {
-    try {
-        const data = '0xb86d1d63000000000000000000000000' + wallet.address.slice(2).toLowerCase();
-        try { await wallet.estimateGas({ to: tokenAddress, data: data }); }
-        catch (e) { logHelper(idx, 'WARN', `Faucet ${tokenName} Skip (Cooldown)`); return false; }
-
-        const tx = await wallet.sendTransaction({ to: tokenAddress, data: data, gasLimit: 200000, gasPrice: await provider.getGasPrice() });
-        await tx.wait();
-        logHelper(idx, 'SUCCESS', `Faucet ${tokenName} Caimed`);
-        return true;
-    } catch (e) { logHelper(idx, 'WARN', `Faucet ${tokenName} Failed: ${e.message.split('(')[0]}`); return false; }
-}
-
-async function approveToken(wallet, tokenAddress, spender, idx) {
     try {
         const data = '0x095ea7b3' + '000000000000000000000000' + spender.slice(2).toLowerCase() + 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff';
-        const tx = await wallet.sendTransaction({ to: tokenAddress, data: data, gasLimit: 100000, gasPrice: await provider.getGasPrice() });
+        const tx = await wallet.sendTransaction({ to: tokenAddress, data, gasLimit: 100000, gasPrice: await provider.getGasPrice() });
         await tx.wait();
         return true;
-    } catch (e) { return true; }
+    } catch { return false; }
 }
 
-async function depositVault(wallet, type, idx) {
+async function claimWebFaucet(wallet, tokenAddress, idx) {
+    return await withRetry(async () => {
+        const data = '0xb86d1d63000000000000000000000000' + wallet.address.slice(2).toLowerCase();
+        await wallet.estimateGas({ to: tokenAddress, data });
+        const tx = await wallet.sendTransaction({ to: tokenAddress, data, gasLimit: 200000, gasPrice: await provider.getGasPrice() });
+        await tx.wait();
+        return true;
+    }, idx, 'webFaucet');
+}
+
+async function depositVault(wallet, type, idx, reserveAmount = 550) {
     const tokenAddr = type === 1 ? USDC_ADDR : USDT_ADDR;
-    const tokenName = type === 1 ? 'USDC' : 'USDT';
-
-    // Balance Check
-    const bal = await getTokenBalance(wallet, tokenAddr);
     const decimals = type === 1 ? 6 : 18;
-    const required = type === 1 ? ethers.BigNumber.from("1000000000") : ethers.BigNumber.from("1000000000000000000000");
+    const buffer = ethers.utils.parseUnits(reserveAmount.toString(), decimals);
 
-    if (bal.lt(required)) {
-        logHelper(idx, 'WARN', `Deposit ${tokenName} Skipped: Low Balance (${ethers.utils.formatUnits(bal, decimals)})`);
-        return false;
-    }
+    const bal = await getTokenBalance(wallet, tokenAddr);
+    if (bal.lte(buffer)) return { success: true, result: 'skip' };
 
-    try {
+    const depositAmount = bal.sub(buffer);
+
+    return await withRetry(async () => {
+        await ensureApproval(wallet, tokenAddr, VAULT_ADDR);
+
         const selector = '0x68afada4';
-        const typeHex = type === 1
-            ? '0000000000000000000000000000000000000000000000000000000000000001'
-            : '0000000000000000000000000000000000000000000000000000000000000000';
-        let amountHex;
-        if (type === 1) amountHex = '000000000000000000000000000000000000000000000000000000003b9aca00';
-        else amountHex = '00000000000000000000000000000000000000000000003635c9adc5dea00000';
+        const typeHex = ethers.utils.hexZeroPad(ethers.BigNumber.from(type).toHexString(), 32).slice(2);
+        const amountHex = ethers.utils.hexZeroPad(depositAmount.toHexString(), 32).slice(2);
         const lockHex = '0000000000000000000000000000000000000000000000000000000000000000';
-
         const data = selector + typeHex + amountHex + lockHex;
-        const tx = await wallet.sendTransaction({ to: VAULT_ADDR, data: data, gasLimit: 500000, gasPrice: await provider.getGasPrice() });
+
+        const tx = await wallet.sendTransaction({ to: VAULT_ADDR, data, gasLimit: 500000, gasPrice: await provider.getGasPrice() });
         await tx.wait();
-        logHelper(idx, 'SUCCESS', `Vault ${tokenName} Deposit Confirmed`);
         return true;
-    } catch (e) {
-        logHelper(idx, 'WARN', `Deposit ${tokenName} Failed: ${e.message.split('(')[0]}`);
-        return false;
-    }
+    }, idx, 'dailyTask');
 }
 
-const createClient = (proxy) => {
-    const agent = proxy ? new HttpsProxyAgent(proxy) : undefined;
-    const userAgent = new UserAgent({ deviceCategory: 'desktop' }).toString();
-    return axios.create({
-        baseURL: config.baseUrl, httpsAgent: agent,
-        headers: {
-            'apikey': config.apiKey, 'content-type': 'application/json', 'origin': config.origin, 'referer': config.referer,
-            'user-agent': userAgent, 'sec-ch-ua': '"Google Chrome";v="143"', 'sec-ch-ua-mobile': '?0', 'sec-ch-ua-platform': '"Windows"', 'sec-fetch-dest': 'empty', 'sec-fetch-mode': 'cors', 'sec-fetch-site': 'cross-site'
-        }
-    });
-};
+// ============================================
+// DISCORD FAUCET
+// ============================================
 
-// --- SINGLE ACCOUNT PROCESSOR ---
-const processAccount = async (account, index, currentState) => {
+async function claimDiscordFaucet(account, idx) {
+    if (!account.discordToken) {
+        state[idx].discordFaucet = '❌NoTkn';
+        return false;
+    }
+
+    state[idx].discordFaucet = '🔄';
+    renderDashboard();
+
+    const client = createDiscordClient(account.discordToken, account.proxy);
+    let success = false;
+
+    for (const faucet of config.faucets) {
+        const result = await withRetry(async () => {
+            await sleep(antiDetect.interactionDelay());
+
+            const res = await client.get(`https://discord.com/api/v9/channels/${faucet.channelId}/messages?limit=10`);
+            if (res.status !== 200) throw new Error(`Fetch failed: ${res.status}`);
+
+            const msg = res.data.find(m =>
+                m.author.id === config.discordAppId &&
+                m.components?.some(row => row.components?.some(c => c.custom_id === faucet.customId))
+            );
+
+            if (!msg) throw new Error('Message not found');
+
+            await sleep(antiDetect.interactionDelay());
+
+            const nonce = ethers.BigNumber.from(Date.now()).mul(1000).toString();
+            const payload = {
+                type: 3,
+                guild_id: config.discordGuildId,
+                channel_id: faucet.channelId,
+                message_id: msg.id,
+                application_id: config.discordAppId,
+                session_id: antiDetect.generateSessionId(),
+                nonce,
+                data: { component_type: 2, custom_id: faucet.customId }
+            };
+
+            const clickRes = await client.post('https://discord.com/api/v9/interactions', payload);
+            if (clickRes.status === 204) return true;
+            if (clickRes.status === 429) {
+                const retryAfter = clickRes.data.retry_after || 60;
+                await sleep(retryAfter * 1000);
+                throw new Error('Rate limited');
+            }
+            throw new Error(`Click failed: ${clickRes.status}`);
+        }, idx, 'discordFaucet');
+
+        if (result.success) success = true;
+        await randomSleep();
+    }
+
+    state[idx].discordFaucet = success ? '✅' : '❌';
+    state[idx].lastDiscord = Date.now();
+    return success;
+}
+
+async function processDailyQuiz(account, idx) {
+    state[idx].dailyQuiz = '🔄';
+    renderDashboard();
+
+    const client = createClient(account.proxy);
+    const wallet = new ethers.Wallet(account.privateKey, provider);
+    const addressLower = wallet.address.toLowerCase();
+
+    return await withRetry(async () => {
+        // Try guessing answer 1 first
+        let answer = 1;
+        try {
+            const res = await client.post('/functions/v1/submit-quiz-answer', {
+                wallet_address: addressLower,
+                selected_answer: answer
+            });
+
+            if (res.data?.correct) {
+                state[idx].dailyQuiz = '✅';
+                return true;
+            }
+
+            // If incorrect, check if we can retry with the correct answer
+            if (!res.data?.correct && res.data?.attempts_used < res.data?.max_attempts && res.data?.correct_answer) {
+                console.log(chalk.yellow(`[Acc ${idx + 1}] Quiz: Answer ${answer} wrong. Retrying with ${res.data.correct_answer}...`));
+                await sleep(2000);
+
+                const retryRes = await client.post('/functions/v1/submit-quiz-answer', {
+                    wallet_address: addressLower,
+                    selected_answer: res.data.correct_answer
+                });
+
+                if (retryRes.data?.correct) {
+                    state[idx].dailyQuiz = '✅';
+                    return true;
+                }
+            }
+
+            throw new Error(res.data?.message || 'Quiz failed');
+
+        } catch (e) {
+            if (e.response?.data?.message?.includes('already') || e.message?.includes('already')) {
+                state[idx].dailyQuiz = '✅';
+                return true;
+            }
+            throw e;
+        }
+    }, idx, 'dailyQuiz');
+}
+
+// ============================================
+// DAILY TASKS
+// ============================================
+
+async function processDailyTasks(account, idx) {
+    state[idx].dailyTask = '🔄';
+    state[idx].webFaucet = '🔄';
+    renderDashboard();
+
     const wallet = new ethers.Wallet(account.privateKey, provider);
     const client = createClient(account.proxy);
     const addressLower = wallet.address.toLowerCase();
 
-    logHelper(index, 'INFO', 'Starting Cycle...');
-    let points = 0;
-
-    // 1. Profile
-    try {
-        const profileRes = await client.get(`/rest/v1/user_profiles_public?select=total_liq_earned&wallet_address=eq.${addressLower}`);
-        if (profileRes.data?.[0]) points = profileRes.data[0].total_liq_earned;
-        logHelper(index, 'SUCCESS', `Points: ${points}`);
-    } catch { }
-
-    logHelper(index, 'INFO', 'Checking Tasks...');
-    const taskStatus = { daily: 'Pend', vaultUSDC: 'Pend', vaultUSDT: 'Pend' };
-    const tasks = [
-        { id: 'daily-checkin', key: 'daily', type: null },
-        { id: 'daily-deposit-tusdc-1000', key: 'vaultUSDC', type: 'tusdc' },
-        { id: 'daily-deposit-tusdt-1000', key: 'vaultUSDT', type: 'tusdt' }
-    ];
-
-    for (const t of tasks) {
-        try {
-            const vRes = await client.post('/functions/v1/verify-deposit-task', { wallet_address: addressLower, task_id: t.id, token_type: t.type });
-            if (vRes.data?.verified || vRes.data?.message?.includes('already')) taskStatus[t.key] = 'DONE';
-        } catch (e) { if (e.response?.data?.message?.includes('already')) taskStatus[t.key] = 'DONE'; }
-    }
-
-    // 2. Actions
-    if (taskStatus.daily !== 'DONE') {
-        try {
-            const res = await client.post('/functions/v1/verify-deposit-task', { wallet_address: addressLower, task_id: 'daily-checkin', token_type: null });
-            if (res.data?.verified) { logHelper(index, 'SUCCESS', 'Daily Check-in Success'); taskStatus.daily = 'DONE'; }
-        } catch (e) { }
-        await sleep(1000);
-    }
-
-    if (taskStatus.vaultUSDC !== 'DONE') {
-        await claimFaucet(wallet, USDC_ADDR, 'USDC', index);
-        await sleep(2000);
-        await ensureApproval(wallet, USDC_ADDR, VAULT_ADDR, index);
-        logHelper(index, 'INFO', 'Depositing USDC...');
-        const ok = await depositVault(wallet, 1, index);
-        if (ok) {
-            await sleep(5000);
-            try {
-                const vRes = await client.post('/functions/v1/verify-deposit-task', { wallet_address: addressLower, task_id: 'daily-deposit-tusdc-1000', token_type: 'tusdc' });
-                if (vRes.data?.verified) { logHelper(index, 'SUCCESS', 'USDC Task Verified!'); taskStatus.vaultUSDC = 'DONE'; }
-            } catch { }
-        }
-    }
-
-    if (taskStatus.vaultUSDT !== 'DONE') {
-        await claimFaucet(wallet, USDT_ADDR, 'USDT', index);
-        await sleep(2000);
-        await ensureApproval(wallet, USDT_ADDR, VAULT_ADDR, index);
-        logHelper(index, 'INFO', 'Depositing USDT...');
-        const ok = await depositVault(wallet, 0, index);
-        if (ok) {
-            await sleep(5000);
-            try {
-                const vRes = await client.post('/functions/v1/verify-deposit-task', { wallet_address: addressLower, task_id: 'daily-deposit-tusdt-1000', token_type: 'tusdt' });
-                if (vRes.data?.verified) { logHelper(index, 'SUCCESS', 'USDT Task Verified!'); taskStatus.vaultUSDT = 'DONE'; }
-            } catch { }
-        }
-    }
-
-    // 3. Final Fetch
-    let streak = 0;
+    // 1. Fetch current points & streak
     try {
         const [profileRes, streakRes] = await Promise.all([
             client.get(`/rest/v1/user_profiles_public?select=total_liq_earned&wallet_address=eq.${addressLower}`),
             client.get(`/rest/v1/user_streaks_public?select=current_streak&wallet_address=eq.${addressLower}`)
         ]);
-        if (profileRes.data?.[0]) points = profileRes.data[0].total_liq_earned;
-        if (streakRes.data?.[0]) streak = streakRes.data[0].current_streak;
+        if (profileRes.data?.[0]) state[idx].points = profileRes.data[0].total_liq_earned;
+        if (streakRes.data?.[0]) state[idx].streak = streakRes.data[0].current_streak;
+    } catch { }
+    renderDashboard();
+
+    // 2. Web Faucet Claims
+    const usdcResult = await claimWebFaucet(wallet, USDC_ADDR, idx);
+    await randomSleep();
+    const usdtResult = await claimWebFaucet(wallet, USDT_ADDR, idx);
+
+    state[idx].webFaucet = (usdcResult.success || usdtResult.success) ? '✅' : '⏳CD';
+    renderDashboard();
+
+    // 3. Daily Check-in
+    const checkinResult = await withRetry(async () => {
+        const res = await client.post('/functions/v1/verify-deposit-task', {
+            wallet_address: addressLower,
+            task_id: 'daily-checkin',
+            token_type: null
+        });
+        if (res.data?.verified || res.data?.message?.includes('already')) return true;
+        throw new Error(res.data?.message || 'Not verified');
+    }, idx, 'dailyTask');
+
+    await randomSleep();
+
+    // 4. Deposit to Vault
+    await depositVault(wallet, 1, idx);
+    await randomSleep();
+    await depositVault(wallet, 0, idx);
+    await randomSleep();
+
+    // 5. Verify deposit tasks
+    for (const task of [
+        { id: 'daily-deposit-tusdc-1000', type: 'tusdc' },
+        { id: 'daily-deposit-tusdt-1000', type: 'tusdt' }
+    ]) {
+        await withRetry(async () => {
+            const res = await client.post('/functions/v1/verify-deposit-task', {
+                wallet_address: addressLower,
+                task_id: task.id,
+                token_type: task.type
+            });
+            return res.data?.verified;
+        }, idx, 'dailyTask');
+        await randomSleep();
+    }
+
+    // 6. Daily Quiz
+    await processDailyQuiz(account, idx);
+    await randomSleep();
+
+    // 7. Final status fetch
+    try {
+        const [profileRes, streakRes] = await Promise.all([
+            client.get(`/rest/v1/user_profiles_public?select=total_liq_earned&wallet_address=eq.${addressLower}`),
+            client.get(`/rest/v1/user_streaks_public?select=current_streak&wallet_address=eq.${addressLower}`)
+        ]);
+        if (profileRes.data?.[0]) state[idx].points = profileRes.data[0].total_liq_earned;
+        if (streakRes.data?.[0]) state[idx].streak = streakRes.data[0].current_streak;
     } catch { }
 
-    let cycleResult = (taskStatus.daily === 'DONE' && taskStatus.vaultUSDC === 'DONE' && taskStatus.vaultUSDT === 'DONE') ? 'Complete' : 'Partial';
-    logHelper(index, 'SUCCESS', `Cycle Finished: ${cycleResult}`);
+    state[idx].dailyTask = checkinResult.success ? '✅' : '❌';
+    state[idx].lastDaily = Date.now();
+    state[idx].nextDaily = getNextDailySchedule();
+}
 
-    // Update State
-    currentState[index] = {
-        name: `Acc ${index + 1}`,
-        points: (points !== undefined && points !== null) ? points : '-',
-        streak: streak,
-        status: cycleResult,
-        lastRun: moment().format('DD/MM HH:mm')
-    };
-};
+// ============================================
+// DUEL FUNCTIONS
+// ============================================
 
-const showGrandSummary = (state, nextRunStr) => {
-    console.log('\n' + chalk.bold.cyan('================================================================================================'));
-    console.log(chalk.bold.cyan(`                                  🤖 SIPAL LIQUICORE BOT 🤖`));
-    console.log(chalk.bold.cyan('================================================================================================'));
+async function getOpenDuels(wallet) {
+    try {
+        const contract = new ethers.Contract(DUEL_ADDR, DUEL_ABI, wallet);
+        const duels = await contract.getOpenDuels();
+        return duels
+            .filter(d => d.challenger.toLowerCase() !== wallet.address.toLowerCase())
+            .map(d => ({
+                id: d.id.toNumber(),
+                challenger: d.challenger,
+                opponent: d.opponent,
+                wagerAmount: d.wagerAmount,
+                wagerToken: d.wagerToken,
+                duelType: d.duelType,
+                status: d.status
+            }));
+    } catch { return []; }
+}
 
-    const table = new Table({
-        head: ['Account', 'Points', 'Streak', 'Status', 'Last Run', 'Next Run'],
-        style: { head: ['cyan'], border: ['grey'] },
-        colWidths: [10, 12, 10, 12, 15, 15] // Adjusted widths
+async function getDuelById(wallet, duelId) {
+    try {
+        const contract = new ethers.Contract(DUEL_ADDR, DUEL_ABI, wallet);
+        const duel = await contract.getDuel(duelId);
+        if (!duel.challenger || duel.challenger === ethers.constants.AddressZero) return null;
+        return {
+            id: duel.id.toNumber(),
+            challenger: duel.challenger,
+            opponent: duel.opponent,
+            wagerAmount: duel.wagerAmount,
+            wagerToken: duel.wagerToken,
+            duelType: duel.duelType,
+            status: duel.status,
+            winner: duel.winner,
+            prizeClaimed: duel.prizeClaimed
+        };
+    } catch { return null; }
+}
+
+async function findClaimableDuels(wallet) {
+    try {
+        const contract = new ethers.Contract(DUEL_ADDR, DUEL_ABI, wallet);
+        const userDuelIds = await contract.getUserDuels(wallet.address);
+        const claimable = [];
+
+        for (const duelIdBN of userDuelIds.slice(-20)) {
+            const duel = await getDuelById(wallet, duelIdBN.toNumber());
+            if (duel && duel.status === DUEL_STATUS.RESOLVED &&
+                duel.winner.toLowerCase() === wallet.address.toLowerCase() &&
+                !duel.prizeClaimed) {
+                claimable.push(duel);
+            }
+        }
+        return claimable;
+    } catch { return []; }
+}
+
+async function processDuel(account, idx) {
+    state[idx].duelStatus = '🔄';
+    renderDashboard();
+
+    const wallet = new ethers.Wallet(account.privateKey, provider);
+    const client = createClient(account.proxy);
+    const addressLower = wallet.address.toLowerCase();
+
+    // 1. Claim any pending prizes
+    const claimable = await findClaimableDuels(wallet);
+    for (const duel of claimable) {
+        await withRetry(async () => {
+            const iface = new ethers.utils.Interface(DUEL_ABI);
+            const data = iface.encodeFunctionData('claimPrize', [duel.id]);
+            const tx = await wallet.sendTransaction({ to: DUEL_ADDR, data, gasLimit: 200000, gasPrice: await provider.getGasPrice() });
+            await tx.wait();
+            return true;
+        }, idx, 'duelStatus');
+        await randomSleep();
+    }
+
+    // 2. Deposit max to vault for advantage (Reserve 100-500)
+    const reserve = randomDelay(100, 500);
+    console.log(chalk.cyan(`[Acc ${idx + 1}] 🏦 Max Deposit Active (Reserved: ${reserve} tokens)`));
+    await depositVault(wallet, 1, idx, reserve);
+    await depositVault(wallet, 0, idx, reserve);
+
+    // 3. Try to accept or create duels (Run 3x)
+    for (let i = 0; i < 3; i++) {
+        console.log(chalk.cyan(`[Acc ${idx + 1}] ⚔️ Executing Duel Logic Iteration ${i + 1}/3...`));
+
+        let processed = false;
+
+        // Try to accept open duels
+        const openDuels = await getOpenDuels(wallet);
+
+        openDuels.sort((a, b) => {
+            const aDecimals = a.wagerToken.toLowerCase() === USDC_ADDR.toLowerCase() ? 6 : 18;
+            const bDecimals = b.wagerToken.toLowerCase() === USDC_ADDR.toLowerCase() ? 6 : 18;
+            const aAmt = parseFloat(ethers.utils.formatUnits(a.wagerAmount, aDecimals));
+            const bAmt = parseFloat(ethers.utils.formatUnits(b.wagerAmount, bDecimals));
+            return aAmt - bAmt;
+        });
+
+        for (const duel of openDuels) {
+            const isUSDC = duel.wagerToken.toLowerCase() === USDC_ADDR.toLowerCase();
+            const tokenAddr = isUSDC ? USDC_ADDR : USDT_ADDR;
+            const balance = await getTokenBalance(wallet, tokenAddr);
+            if (balance.lt(duel.wagerAmount)) continue;
+
+            const result = await withRetry(async () => {
+                await ensureApproval(wallet, tokenAddr, DUEL_ADDR);
+                const iface = new ethers.utils.Interface(DUEL_ABI);
+                const data = iface.encodeFunctionData('acceptDuel', [duel.id]);
+                const tx = await wallet.sendTransaction({ to: DUEL_ADDR, data, gasLimit: 500000, gasPrice: await provider.getGasPrice() });
+                await tx.wait();
+                return true;
+            }, idx, 'duelStatus');
+
+            if (result.success) {
+                processed = true;
+                break;
+            }
+            await randomSleep();
+        }
+
+        // If no duels to accept, create one
+        if (!processed && openDuels.filter(d => d.challenger.toLowerCase() !== addressLower).length === 0) {
+            const useUSDC = Math.random() < 0.5;
+            const tokenAddr = useUSDC ? USDC_ADDR : USDT_ADDR;
+            const decimals = useUSDC ? 6 : 18;
+
+            const balance = await getTokenBalance(wallet, tokenAddr);
+            const minWager = ethers.utils.parseUnits("50", decimals);
+
+            if (balance.gte(minWager)) {
+                const maxPossible = Math.min(500, Math.floor(parseFloat(ethers.utils.formatUnits(balance, decimals)) * 0.9));
+                const rawAmount = randomDelay(50, maxPossible);
+                const wagerAmount = ethers.utils.parseUnits(rawAmount.toString(), decimals);
+
+                const result = await withRetry(async () => {
+                    await ensureApproval(wallet, tokenAddr, DUEL_ADDR);
+                    const iface = new ethers.utils.Interface(DUEL_ABI);
+                    const data = iface.encodeFunctionData('createDuel', [wagerAmount, tokenAddr, 0]);
+                    const tx = await wallet.sendTransaction({ to: DUEL_ADDR, data, gasLimit: 500000, gasPrice: await provider.getGasPrice() });
+                    await tx.wait();
+                    return true;
+                }, idx, 'duelStatus');
+
+                if (result.success) processed = true;
+            }
+        }
+
+        if (i < 2) await sleep(5000 + Math.random() * 5000); // Wait 5-10s between iterations
+    }
+
+    // 5. Verify duel task
+    await withRetry(async () => {
+        const res = await client.post('/functions/v1/verify-onchain-task', {
+            wallet_address: addressLower,
+            task_id: 'daily-duel-create'
+        });
+        return res.data?.verified;
+    }, idx, 'duelStatus');
+
+    state[idx].duelStatus = '✅';
+    state[idx].lastDuel = Date.now();
+    state[idx].nextDuel = new Date(Date.now() + config.duelInterval);
+}
+
+// ============================================
+// MAIN LOOP
+// ============================================
+
+async function main() {
+    accounts.forEach((_, i) => {
+        state[i] = createState(i);
+        // Force immediate check on startup (set to 1 min ago), then it will sync to 14:00
+        state[i].nextDaily = new Date(Date.now() - 60000);
+        state[i].nextDuel = new Date(Date.now() + randomDelay(5000, 30000));
     });
 
-    Object.keys(state).sort().forEach(idx => {
-        const s = state[idx];
-        table.push([s.name, s.points, s.streak, s.status, s.lastRun, nextRunStr || '-']);
-    });
-
-    console.log(table.toString());
-    console.log(chalk.bold.cyan('================================================================================================\n'));
-};
-
-const main = async () => {
-    await displayBanner();
-
-    // In-memory state (resets on restart, perfect)
-    const botState = {};
-    accounts.forEach((acc, idx) => {
-        botState[idx] = { name: `Acc ${idx + 1}`, points: '-', streak: '-', status: 'Pending', lastRun: '-' };
-    });
-
-    // SCHEDULE CONFIG (12:00 WIB)
-    const SCHEDULED_HOUR = 12;
-    const SCHEDULED_MINUTE = 0;
+    renderDashboard();
 
     while (true) {
-        try {
-            // Run Cycle for ALL accounts (One by One)
-            for (let i = 0; i < accounts.length; i++) {
-                await processAccount(accounts[i], i, botState);
-                await sleep(2000);
+        const now = Date.now();
+
+        for (let i = 0; i < accounts.length; i++) {
+            const acc = accounts[i];
+            const s = state[i];
+
+            if (s.isProcessing) continue;
+
+            // 1. DAILY TASKS + WEB FAUCET (14:00 WIB)
+            if (s.nextDaily && now >= s.nextDaily.getTime()) {
+                s.isProcessing = true;
+                try {
+                    await processDailyTasks(acc, i);
+                } catch (e) {
+                    logError(i, `Daily: ${e.message?.slice(0, 50)}`);
+                    s.dailyTask = '❌';
+                }
+                s.isProcessing = false;
+                renderDashboard();
             }
 
-            // Calc Next Run
-            const nextRun = getNextScheduledTime(SCHEDULED_HOUR, SCHEDULED_MINUTE);
-            const nextRunStr = moment(nextRun).format('DD/MM HH:mm');
+            // 2. DISCORD FAUCET (every 30 minutes)
+            const discordDue = s.lastDiscord === 0 || (now - s.lastDiscord >= config.discordInterval);
+            if (acc.discordToken && discordDue && !s.isProcessing) {
+                s.isProcessing = true;
+                try {
+                    await claimDiscordFaucet(acc, i);
+                } catch (e) {
+                    logError(i, `Discord: ${e.message?.slice(0, 50)}`);
+                    s.discordFaucet = '❌';
+                }
+                s.isProcessing = false;
+                renderDashboard();
+            }
 
-            console.log(chalk.bold.cyan(`\n⏰ Next cycle scheduled at: ${nextRunStr}`));
-
-            // Show Final Summary (ONCE)
-            showGrandSummary(botState, nextRunStr);
-
-            // Wait for Schedule
-            await waitUntilScheduledTime(SCHEDULED_HOUR, SCHEDULED_MINUTE);
-
-        } catch (e) {
-            console.log(chalk.red(`Fatal Loop Error: ${e.message}`));
-            await sleep(60000);
+            // 3. DUEL (random 1-5 minutes)
+            if (s.nextDuel && now >= s.nextDuel.getTime() && !s.isProcessing) {
+                s.isProcessing = true;
+                try {
+                    await processDuel(acc, i);
+                } catch (e) {
+                    logError(i, `Duel: ${e.message?.slice(0, 50)}`);
+                    s.duelStatus = '❌';
+                }
+                s.isProcessing = false;
+                renderDashboard();
+            }
         }
-    }
-};
 
-main();
+        renderDashboard();
+        await sleep(1000);
+    }
+}
+
+process.on('SIGINT', () => {
+    clearScreen();
+    console.log(chalk.yellow('\n👋 Bot stopped gracefully. Goodbye!'));
+    process.exit(0);
+});
+
+main().catch(e => {
+    console.error(chalk.red('Fatal error:'), e);
+    process.exit(1);
+});
