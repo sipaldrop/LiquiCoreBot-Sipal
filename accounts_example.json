@@ -1,10 +1,12 @@
 [
     {
         "privateKey": "0xYOUR_PRIVATE_KEY_HERE",
-        "proxy": "http://user:pass@ip:port"
+        "proxy": "http://user:pass@ip:port",
+        "discordToken": "YOUR_DISCORD_TOKEN_HERE"
     },
     {
         "privateKey": "0xANOTHER_PRIVATE_KEY",
-        "proxy": null
+        "proxy": null,
+        "discordToken": null
     }
 ]
