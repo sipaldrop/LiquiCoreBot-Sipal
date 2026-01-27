@@ -21,10 +21,10 @@ const config = {
     retryDelay: 3000,
 
     // SCHEDULE CONFIG
-    dailyHour: 14,        // 14:00 WIB (2 PM)
+    dailyHour: 16,        // 16:00 WIB (4 PM)
     dailyMinute: 0,
     discordInterval: 30 * 60 * 1000, // 30 minutes
-    duelInterval: 3 * 60 * 60 * 1000, // 3 hours
+    duelInterval: 5 * 60 * 60 * 1000, // 5 hours
 
 
     // DISCORD CONFIG
@@ -87,7 +87,13 @@ function rotateRpc() {
 const USDC_ADDR = '0xe4da02B0188D98A10244c1bD265Ea0aF36be205a';
 const USDT_ADDR = '0x29565d182bF1796a3836a68D22D833d92795725A';
 const VAULT_ADDR = '0x11e4e6cD5D9E60646219098d99CfaFd130cdcE93';
-const DUEL_ADDR = '0xc77bcFc8F258b69655A34000213B3cBBC35ae0cA';
+const DUEL_ADDR = '0xe85a13581bFa506F4A1E903312E13842f1863c1f'; // V2 Contract
+
+// V2 LIMITS
+const DAILY_DUEL_LIMIT = 10;
+const SAME_OPPONENT_LIMIT = 3;
+const RATE_LIMIT_DUELS = 3;
+const RATE_LIMIT_WINDOW = 2 * 60 * 1000; // 2 minutes
 
 // DUEL ABI
 const DUEL_ABI = [
@@ -126,7 +132,9 @@ const createState = (index) => ({
     lastDiscord: 0,
     lastDaily: 0,
     lastDuel: 0,
-    isProcessing: false
+    isProcessing: false,
+    duelHistory: [], // Array of { timestamp, opponent }
+    dailyDuelCount: 0
 });
 
 // ============================================
@@ -616,7 +624,6 @@ async function processDailyTasks(account, idx) {
 
     state[idx].dailyTask = checkinResult.success ? '✅' : '❌';
     state[idx].lastDaily = Date.now();
-    state[idx].nextDaily = getNextDailySchedule();
 }
 
 // ============================================
@@ -686,6 +693,25 @@ async function processDuel(account, idx) {
     const client = createClient(account.proxy);
     const addressLower = wallet.address.toLowerCase();
 
+    // 0. CHECK V2 LIMITS
+    const now = Date.now();
+    // Filter history for current day
+    const today = new Date().setHours(0, 0, 0, 0);
+    state[idx].duelHistory = state[idx].duelHistory.filter(h => h.timestamp > today);
+    state[idx].dailyDuelCount = state[idx].duelHistory.length;
+
+    if (state[idx].dailyDuelCount >= DAILY_DUEL_LIMIT) {
+        state[idx].duelStatus = '✅Limit';
+        return;
+    }
+
+    // Rate Limit Check (Max 3 in 2 mins)
+    const recentDuels = state[idx].duelHistory.filter(h => now - h.timestamp < RATE_LIMIT_WINDOW);
+    if (recentDuels.length >= RATE_LIMIT_DUELS) {
+        state[idx].duelStatus = '⏳Rate';
+        return;
+    }
+
     // 1. Claim any pending prizes
     const claimable = await findClaimableDuels(wallet);
     for (const duel of claimable) {
@@ -699,19 +725,19 @@ async function processDuel(account, idx) {
         await randomSleep();
     }
 
-    // 2. Deposit max to vault for advantage (Reserve 100-500)
-    const reserve = randomDelay(100, 500);
-    console.log(chalk.cyan(`[Acc ${idx + 1}] 🏦 Max Deposit Active (Reserved: ${reserve} tokens)`));
-    await depositVault(wallet, 1, idx, reserve);
-    await depositVault(wallet, 0, idx, reserve);
-
-    // 3. Try to accept or create duels (Run 3x)
+    // 2. Try to accept or create duels (Run 3x)
     for (let i = 0; i < 3; i++) {
         console.log(chalk.cyan(`[Acc ${idx + 1}] ⚔️ Executing Duel Logic Iteration ${i + 1}/3...`));
 
+        // Re-check rate limit inside loop
+        if (state[idx].duelHistory.filter(h => Date.now() - h.timestamp < RATE_LIMIT_WINDOW).length >= RATE_LIMIT_DUELS) {
+            console.log(chalk.yellow(`[Acc ${idx + 1}] ⏳ Rate limit reached, skipping iteration.`));
+            break;
+        }
+
         let processed = false;
 
-        // Try to accept open duels
+        // Try to accept open duels (Limit to < $500 to avoid whales/instant limit hit)
         const openDuels = await getOpenDuels(wallet);
 
         openDuels.sort((a, b) => {
@@ -725,8 +751,21 @@ async function processDuel(account, idx) {
         for (const duel of openDuels) {
             const isUSDC = duel.wagerToken.toLowerCase() === USDC_ADDR.toLowerCase();
             const tokenAddr = isUSDC ? USDC_ADDR : USDT_ADDR;
+            const decimals = isUSDC ? 6 : 18;
+            const amount = parseFloat(ethers.utils.formatUnits(duel.wagerAmount, decimals));
+
+            // Strategy: Skip whales
+            if (amount > 500) continue;
+
             const balance = await getTokenBalance(wallet, tokenAddr);
             if (balance.lt(duel.wagerAmount)) continue;
+
+            // CHECK OPPONENT LIMIT (Max 3/day)
+            const opponentCount = state[idx].duelHistory.filter(h => h.opponent.toLowerCase() === duel.challenger.toLowerCase()).length;
+            if (opponentCount >= SAME_OPPONENT_LIMIT) {
+                console.log(chalk.yellow(`[Acc ${idx + 1}] 🚫 Skipping opponent ${duel.challenger.slice(0, 6)} (Max fights reached)`));
+                continue;
+            }
 
             const result = await withRetry(async () => {
                 await ensureApproval(wallet, tokenAddr, DUEL_ADDR);
@@ -739,7 +778,11 @@ async function processDuel(account, idx) {
 
             if (result.success) {
                 processed = true;
+                state[idx].duelHistory.push({ timestamp: Date.now(), opponent: duel.challenger });
                 break;
+            } else if (result.error?.message?.includes('daily limit') || result.error?.message?.includes('limit reached')) {
+                state[idx].duelStatus = '✅Limit';
+                return; // Stop dueling for this account today
             }
             await randomSleep();
         }
@@ -751,12 +794,18 @@ async function processDuel(account, idx) {
             const decimals = useUSDC ? 6 : 18;
 
             const balance = await getTokenBalance(wallet, tokenAddr);
-            const minWager = ethers.utils.parseUnits("50", decimals);
+            // Strategy: Target $420/hour to hit $10k/day evenly
+            const minWager = ethers.utils.parseUnits("400", decimals);
 
             if (balance.gte(minWager)) {
-                const maxPossible = Math.min(500, Math.floor(parseFloat(ethers.utils.formatUnits(balance, decimals)) * 0.9));
-                const rawAmount = randomDelay(50, maxPossible);
+                // Target 400-450 range
+                const rawAmount = randomDelay(400, 450);
                 const wagerAmount = ethers.utils.parseUnits(rawAmount.toString(), decimals);
+
+                if (balance.lt(wagerAmount)) {
+                    console.log(chalk.yellow(`[Acc ${idx + 1}] ⚠️ Balance low for optimal wager, skipping creation.`));
+                    continue;
+                }
 
                 const result = await withRetry(async () => {
                     await ensureApproval(wallet, tokenAddr, DUEL_ADDR);
@@ -767,14 +816,29 @@ async function processDuel(account, idx) {
                     return true;
                 }, idx, 'duelStatus');
 
-                if (result.success) processed = true;
+                if (result.success) {
+                    processed = true;
+                    // For created duels, we don't know the opponent yet, so we just track the action timestamp
+                    // We can use a placeholder opponent or just track it for rate limit
+                    state[idx].duelHistory.push({ timestamp: Date.now(), opponent: 'unknown_created' });
+                }
+                else if (result.error?.message?.includes('daily limit') || result.error?.message?.includes('limit reached')) {
+                    state[idx].duelStatus = '✅Limit';
+                    return; // Stop dueling
+                }
             }
         }
 
         if (i < 2) await sleep(5000 + Math.random() * 5000); // Wait 5-10s between iterations
     }
 
-    // 5. Verify duel task
+    // 3. Deposit max to vault for advantage (Reserve 100-500)
+    const reserve = randomDelay(100, 500);
+    console.log(chalk.cyan(`[Acc ${idx + 1}] 🏦 Max Deposit Active (Reserved: ${reserve} tokens)`));
+    await depositVault(wallet, 1, idx, reserve);
+    await depositVault(wallet, 0, idx, reserve);
+
+    // 4. Verify duel task
     await withRetry(async () => {
         const res = await client.post('/functions/v1/verify-onchain-task', {
             wallet_address: addressLower,
@@ -821,6 +885,7 @@ async function main() {
                     s.dailyTask = '❌';
                 }
                 s.isProcessing = false;
+                s.nextDaily = getNextDailySchedule();
                 renderDashboard();
             }
 
