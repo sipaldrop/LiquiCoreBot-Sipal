@@ -164,11 +164,15 @@ function getNextDailySchedule() {
     return next;
 }
 
-function logError(idx, msg) {
+function logError(idx, msg, rawError = null) {
     const time = moment().format('HH:mm:ss');
     const logMsg = `[${time}] [Acc ${idx + 1}] ❌ ${msg}`;
     errorLogs.push(logMsg);
     if (errorLogs.length > MAX_ERROR_LOGS) errorLogs.shift();
+    if (rawError) {
+        console.log(chalk.red(`[Acc ${idx + 1}] Detailed Error:`), rawError.message || rawError);
+        if (rawError.reason) console.log(chalk.red(`[Acc ${idx + 1}] Reason:`), rawError.reason);
+    }
 }
 
 // ============================================
@@ -211,7 +215,8 @@ async function withRetry(fn, idx, actionName, maxRetries = config.maxRetries) {
         }
     }
 
-    logError(idx, `${actionName}: ${lastError?.message?.slice(0, 50) || 'Failed after 5 retries'}`);
+    const failReason = lastError?.reason || lastError?.message || 'Failed after 5 retries';
+    logError(idx, `${actionName}: ${failReason.slice(0, 200)}`, lastError);
     return { success: false, error: lastError };
 }
 
@@ -387,10 +392,14 @@ async function ensureApproval(wallet, tokenAddress, spender) {
 
     try {
         const data = '0x095ea7b3' + '000000000000000000000000' + spender.slice(2).toLowerCase() + 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff';
-        const tx = await wallet.sendTransaction({ to: tokenAddress, data, gasLimit: 100000, gasPrice: await provider.getGasPrice() });
+        const gasPrice = (await provider.getGasPrice()).mul(110).div(100);
+        const tx = await wallet.sendTransaction({ to: tokenAddress, data, gasLimit: 200000, gasPrice });
         await tx.wait();
         return true;
-    } catch { return false; }
+    } catch (e) {
+        console.log(chalk.red(`⚠️ Approval Error: ${e.reason || e.message}`));
+        return false;
+    }
 }
 
 async function claimWebFaucet(wallet, tokenAddress, idx) {
@@ -414,7 +423,8 @@ async function depositVault(wallet, type, idx, reserveAmount = 550) {
     const depositAmount = bal.sub(buffer);
 
     return await withRetry(async () => {
-        await ensureApproval(wallet, tokenAddr, VAULT_ADDR);
+        const approved = await ensureApproval(wallet, tokenAddr, VAULT_ADDR);
+        if (!approved) throw new Error('Approval failed');
 
         const selector = '0x68afada4';
         const typeHex = ethers.utils.hexZeroPad(ethers.BigNumber.from(type).toHexString(), 32).slice(2);
@@ -422,7 +432,8 @@ async function depositVault(wallet, type, idx, reserveAmount = 550) {
         const lockHex = '0000000000000000000000000000000000000000000000000000000000000000';
         const data = selector + typeHex + amountHex + lockHex;
 
-        const tx = await wallet.sendTransaction({ to: VAULT_ADDR, data, gasLimit: 500000, gasPrice: await provider.getGasPrice() });
+        const gasPrice = (await provider.getGasPrice()).mul(110).div(100);
+        const tx = await wallet.sendTransaction({ to: VAULT_ADDR, data, gasLimit: 500000, gasPrice });
         await tx.wait();
         return true;
     }, idx, 'dailyTask');
@@ -491,6 +502,39 @@ async function claimDiscordFaucet(account, idx) {
     return success;
 }
 
+// ============================================
+// SHARED STATE FOR COLLABORATIVE QUIZ
+// ============================================
+const DAILY_QUIZ_STATE = {
+    date: '',        // Format: YYYY-MM-DD
+    answer: null,    // Correct answer if found
+    failed: []       // List of answers tried and failed
+};
+
+function getQuizAnswerCandidate() {
+    const today = new Date().toISOString().split('T')[0];
+
+    // Reset if new day
+    if (DAILY_QUIZ_STATE.date !== today) {
+        DAILY_QUIZ_STATE.date = today;
+        DAILY_QUIZ_STATE.answer = null;
+        DAILY_QUIZ_STATE.failed = [];
+        console.log(chalk.magenta(`[QUIZ] New day detected (${today}). Resetting shared quiz memory.`));
+    }
+
+    // 1. If we know the answer, use it
+    if (DAILY_QUIZ_STATE.answer) {
+        return { answer: DAILY_QUIZ_STATE.answer, source: 'known_correct' };
+    }
+
+    // 2. Find first integer not in failed list
+    let candidate = 1;
+    while (DAILY_QUIZ_STATE.failed.includes(candidate)) {
+        candidate++;
+    }
+    return { answer: candidate, source: 'guessing' };
+}
+
 async function processDailyQuiz(account, idx) {
     state[idx].dailyQuiz = '🔄';
     renderDashboard();
@@ -500,8 +544,10 @@ async function processDailyQuiz(account, idx) {
     const addressLower = wallet.address.toLowerCase();
 
     return await withRetry(async () => {
-        // Try guessing answer 1 first
-        let answer = 1;
+        const { answer, source } = getQuizAnswerCandidate();
+
+        console.log(chalk.cyan(`[Acc ${idx + 1}] 🧠 Quiz Strategy: ${source === 'known_correct' ? 'Using known answer' : 'Collaborative guessing'} -> ${answer}`));
+
         try {
             const res = await client.post('/functions/v1/submit-quiz-answer', {
                 wallet_address: addressLower,
@@ -510,23 +556,33 @@ async function processDailyQuiz(account, idx) {
 
             if (res.data?.correct) {
                 state[idx].dailyQuiz = '✅';
+                console.log(chalk.green(`[Acc ${idx + 1}] Quiz Correct! Answer: ${answer}`));
+
+                // Save for others
+                if (!DAILY_QUIZ_STATE.answer) {
+                    DAILY_QUIZ_STATE.answer = answer;
+                    console.log(chalk.green.bold(`[QUIZ] 🎯 FOUND CORRECT ANSWER: ${answer} (Shared with all accounts)`));
+                }
                 return true;
             }
 
-            // If incorrect, check if we can retry with the correct answer
-            if (!res.data?.correct && res.data?.attempts_used < res.data?.max_attempts && res.data?.correct_answer) {
-                console.log(chalk.yellow(`[Acc ${idx + 1}] Quiz: Answer ${answer} wrong. Retrying with ${res.data.correct_answer}...`));
-                await sleep(2000);
+            // If we are here, it was WRONG (or API error handled below)
+            console.log(chalk.yellow(`[Acc ${idx + 1}] Quiz answer ${answer} incorrect.`));
 
-                const retryRes = await client.post('/functions/v1/submit-quiz-answer', {
-                    wallet_address: addressLower,
-                    selected_answer: res.data.correct_answer
-                });
+            // Mark as failed so others don't try it
+            if (!DAILY_QUIZ_STATE.failed.includes(answer)) {
+                DAILY_QUIZ_STATE.failed.push(answer);
+            }
 
-                if (retryRes.data?.correct) {
-                    state[idx].dailyQuiz = '✅';
-                    return true;
-                }
+            // Did API leak the correct answer?
+            if (res.data?.correct_answer) {
+                DAILY_QUIZ_STATE.answer = res.data.correct_answer;
+                console.log(chalk.magenta(`[QUIZ] 🕵️ API leaked correct answer: ${res.data.correct_answer}. Saved for others.`));
+            }
+
+            // Strict 1-shot (unless API says attempts_used < max)
+            if (res.data?.attempts_used < res.data?.max_attempts) {
+                throw new Error('Retrying with next guess...');
             }
 
             throw new Error(res.data?.message || 'Quiz failed');
@@ -702,6 +758,7 @@ async function processDuel(account, idx) {
 
     if (state[idx].dailyDuelCount >= DAILY_DUEL_LIMIT) {
         state[idx].duelStatus = '✅Limit';
+        state[idx].nextDuel = getNextDailySchedule();
         return;
     }
 
@@ -709,6 +766,7 @@ async function processDuel(account, idx) {
     const recentDuels = state[idx].duelHistory.filter(h => now - h.timestamp < RATE_LIMIT_WINDOW);
     if (recentDuels.length >= RATE_LIMIT_DUELS) {
         state[idx].duelStatus = '⏳Rate';
+        state[idx].nextDuel = new Date(Date.now() + RATE_LIMIT_WINDOW);
         return;
     }
 
@@ -718,7 +776,8 @@ async function processDuel(account, idx) {
         await withRetry(async () => {
             const iface = new ethers.utils.Interface(DUEL_ABI);
             const data = iface.encodeFunctionData('claimPrize', [duel.id]);
-            const tx = await wallet.sendTransaction({ to: DUEL_ADDR, data, gasLimit: 200000, gasPrice: await provider.getGasPrice() });
+            const gasPrice = (await provider.getGasPrice()).mul(110).div(100);
+            const tx = await wallet.sendTransaction({ to: DUEL_ADDR, data, gasLimit: 500000, gasPrice }); // 500k is enough for claim
             await tx.wait();
             return true;
         }, idx, 'duelStatus');
@@ -739,6 +798,7 @@ async function processDuel(account, idx) {
 
         // Try to accept open duels (Limit to < $500 to avoid whales/instant limit hit)
         const openDuels = await getOpenDuels(wallet);
+        console.log(chalk.gray(`[Acc ${idx + 1}] 🔍 Found ${openDuels.length} open duels`));
 
         openDuels.sort((a, b) => {
             const aDecimals = a.wagerToken.toLowerCase() === USDC_ADDR.toLowerCase() ? 6 : 18;
@@ -755,10 +815,16 @@ async function processDuel(account, idx) {
             const amount = parseFloat(ethers.utils.formatUnits(duel.wagerAmount, decimals));
 
             // Strategy: Skip whales
-            if (amount > 500) continue;
+            if (amount > 500) {
+                console.log(chalk.gray(`[Acc ${idx + 1}] ⏭️ Skipping duel ${duel.id}: Amount ${amount} > 500`));
+                continue;
+            }
 
             const balance = await getTokenBalance(wallet, tokenAddr);
-            if (balance.lt(duel.wagerAmount)) continue;
+            if (balance.lt(duel.wagerAmount)) {
+                console.log(chalk.gray(`[Acc ${idx + 1}] ⏭️ Skipping duel ${duel.id}: Low balance (${ethers.utils.formatUnits(balance, decimals)} < ${amount})`));
+                continue;
+            }
 
             // CHECK OPPONENT LIMIT (Max 3/day)
             const opponentCount = state[idx].duelHistory.filter(h => h.opponent.toLowerCase() === duel.challenger.toLowerCase()).length;
@@ -768,10 +834,12 @@ async function processDuel(account, idx) {
             }
 
             const result = await withRetry(async () => {
-                await ensureApproval(wallet, tokenAddr, DUEL_ADDR);
+                const approved = await ensureApproval(wallet, tokenAddr, DUEL_ADDR);
+                if (!approved) throw new Error('Approval failed');
                 const iface = new ethers.utils.Interface(DUEL_ABI);
                 const data = iface.encodeFunctionData('acceptDuel', [duel.id]);
-                const tx = await wallet.sendTransaction({ to: DUEL_ADDR, data, gasLimit: 500000, gasPrice: await provider.getGasPrice() });
+                const gasPrice = (await provider.getGasPrice()).mul(110).div(100);
+                const tx = await wallet.sendTransaction({ to: DUEL_ADDR, data, gasLimit: 1000000, gasPrice });
                 await tx.wait();
                 return true;
             }, idx, 'duelStatus');
@@ -780,9 +848,13 @@ async function processDuel(account, idx) {
                 processed = true;
                 state[idx].duelHistory.push({ timestamp: Date.now(), opponent: duel.challenger });
                 break;
-            } else if (result.error?.message?.includes('daily limit') || result.error?.message?.includes('limit reached')) {
-                state[idx].duelStatus = '✅Limit';
-                return; // Stop dueling for this account today
+            } else {
+                console.log(chalk.red(`[Acc ${idx + 1}] ❌ Accept Failed: ${result.error?.message || 'Unknown error'}`));
+                if (result.error?.message?.includes('daily limit') || result.error?.message?.includes('limit reached')) {
+                    state[idx].duelStatus = '✅Limit';
+                    state[idx].nextDuel = getNextDailySchedule();
+                    return; // Stop dueling for this account today
+                }
             }
             await randomSleep();
         }
@@ -797,6 +869,8 @@ async function processDuel(account, idx) {
             // Strategy: Target $420/hour to hit $10k/day evenly
             const minWager = ethers.utils.parseUnits("400", decimals);
 
+            console.log(chalk.gray(`[Acc ${idx + 1}] ⚖️ Creation Balance Check: ${ethers.utils.formatUnits(balance, decimals)} ${useUSDC ? 'USDC' : 'USDT'} (Min: 400)`));
+
             if (balance.gte(minWager)) {
                 // Target 400-450 range
                 const rawAmount = randomDelay(400, 450);
@@ -808,10 +882,12 @@ async function processDuel(account, idx) {
                 }
 
                 const result = await withRetry(async () => {
-                    await ensureApproval(wallet, tokenAddr, DUEL_ADDR);
+                    const approved = await ensureApproval(wallet, tokenAddr, DUEL_ADDR);
+                    if (!approved) throw new Error('Approval failed');
                     const iface = new ethers.utils.Interface(DUEL_ABI);
                     const data = iface.encodeFunctionData('createDuel', [wagerAmount, tokenAddr, 0]);
-                    const tx = await wallet.sendTransaction({ to: DUEL_ADDR, data, gasLimit: 500000, gasPrice: await provider.getGasPrice() });
+                    const gasPrice = (await provider.getGasPrice()).mul(110).div(100);
+                    const tx = await wallet.sendTransaction({ to: DUEL_ADDR, data, gasLimit: 1000000, gasPrice });
                     await tx.wait();
                     return true;
                 }, idx, 'duelStatus');
@@ -821,10 +897,13 @@ async function processDuel(account, idx) {
                     // For created duels, we don't know the opponent yet, so we just track the action timestamp
                     // We can use a placeholder opponent or just track it for rate limit
                     state[idx].duelHistory.push({ timestamp: Date.now(), opponent: 'unknown_created' });
-                }
-                else if (result.error?.message?.includes('daily limit') || result.error?.message?.includes('limit reached')) {
-                    state[idx].duelStatus = '✅Limit';
-                    return; // Stop dueling
+                } else {
+                    console.log(chalk.red(`[Acc ${idx + 1}] ❌ Create Failed: ${result.error?.message || 'Unknown error'}`));
+                    if (result.error?.message?.includes('daily limit') || result.error?.message?.includes('limit reached')) {
+                        state[idx].duelStatus = '✅Limit';
+                        state[idx].nextDuel = getNextDailySchedule();
+                        return; // Stop dueling
+                    }
                 }
             }
         }
@@ -849,7 +928,8 @@ async function processDuel(account, idx) {
 
     state[idx].duelStatus = '✅';
     state[idx].lastDuel = Date.now();
-    state[idx].nextDuel = new Date(Date.now() + config.duelInterval);
+    // Dynamic Scheduling: If not limited, run aggressively (10-30s)
+    state[idx].nextDuel = new Date(Date.now() + randomDelay(10000, 30000));
 }
 
 // ============================================
