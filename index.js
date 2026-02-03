@@ -21,7 +21,7 @@ const config = {
     retryDelay: 3000,
 
     // SCHEDULE CONFIG
-    dailyHour: 16,        // 16:00 WIB (4 PM)
+    dailyHour: 21,        // 21:00 WIB (9 PM)
     dailyMinute: 0,
     discordInterval: 30 * 60 * 1000, // 30 minutes
     duelInterval: 5 * 60 * 60 * 1000, // 5 hours
@@ -86,11 +86,12 @@ function rotateRpc() {
 // Contracts
 const USDC_ADDR = '0xe4da02B0188D98A10244c1bD265Ea0aF36be205a';
 const USDT_ADDR = '0x29565d182bF1796a3836a68D22D833d92795725A';
-const VAULT_ADDR = '0x11e4e6cD5D9E60646219098d99CfaFd130cdcE93';
+const VAULT_ADDR = '0x11e4e6cD5D9E60646219098d99CfaFd130cdcE93'; // RLP Vault (/vault)
+const LAAS_VAULT_ADDR = '0x4FC31E7199ccC0e756c640D65c418d62c1898D12'; // LaaS Vault (/governance) - for daily task verification
 const DUEL_ADDR = '0xe85a13581bFa506F4A1E903312E13842f1863c1f'; // V2 Contract
 
 // V2 LIMITS
-const DAILY_DUEL_LIMIT = 10;
+const DAILY_DUEL_LIMIT = 1;
 const SAME_OPPONENT_LIMIT = 3;
 const RATE_LIMIT_DUELS = 3;
 const RATE_LIMIT_WINDOW = 2 * 60 * 1000; // 2 minutes
@@ -133,7 +134,7 @@ const createState = (index) => ({
     lastDaily: 0,
     lastDuel: 0,
     isProcessing: false,
-    duelHistory: [], // Array of { timestamp, opponent }
+    duelHistory: [], // Array of { timestamp, opponent, amount }
     dailyDuelCount: 0
 });
 
@@ -412,15 +413,35 @@ async function claimWebFaucet(wallet, tokenAddress, idx) {
     }, idx, 'webFaucet');
 }
 
-async function depositVault(wallet, type, idx, reserveAmount = 550) {
+// Deposit to RLP Vault (/vault page)
+async function depositVault(wallet, type, idx, amount = 550, isFixed = false) {
     const tokenAddr = type === 1 ? USDC_ADDR : USDT_ADDR;
+    const tokenName = type === 1 ? 'tUSDC' : 'tUSDT';
     const decimals = type === 1 ? 6 : 18;
-    const buffer = ethers.utils.parseUnits(reserveAmount.toString(), decimals);
 
     const bal = await getTokenBalance(wallet, tokenAddr);
-    if (bal.lte(buffer)) return { success: true, result: 'skip' };
+    const balFormatted = ethers.utils.formatUnits(bal, decimals);
+    console.log(chalk.gray(`[Acc ${idx + 1}] ${tokenName} Balance: ${balFormatted}`));
 
-    const depositAmount = bal.sub(buffer);
+    let depositAmount;
+
+    if (isFixed) {
+        depositAmount = ethers.utils.parseUnits(amount.toString(), decimals);
+        if (bal.lt(depositAmount)) {
+            console.log(chalk.yellow(`[Acc ${idx + 1}] Insufficient ${tokenName}: need ${amount}, have ${balFormatted}`));
+            return { success: true, result: 'skip_insufficient' };
+        }
+    } else {
+        const reserve = ethers.utils.parseUnits(amount.toString(), decimals);
+        if (bal.lte(reserve)) {
+            console.log(chalk.yellow(`[Acc ${idx + 1}] ${tokenName} balance too low for reserve`));
+            return { success: true, result: 'skip' };
+        }
+        depositAmount = bal.sub(reserve);
+    }
+
+    const depositFormatted = ethers.utils.formatUnits(depositAmount, decimals);
+    console.log(chalk.cyan(`[Acc ${idx + 1}] Depositing ${depositFormatted} ${tokenName} to RLP Vault...`));
 
     return await withRetry(async () => {
         const approved = await ensureApproval(wallet, tokenAddr, VAULT_ADDR);
@@ -432,9 +453,68 @@ async function depositVault(wallet, type, idx, reserveAmount = 550) {
         const lockHex = '0000000000000000000000000000000000000000000000000000000000000000';
         const data = selector + typeHex + amountHex + lockHex;
 
+        console.log(chalk.gray(`[Acc ${idx + 1}] RLP Vault TX Data: type=${type}, amount=${depositFormatted}`));
+
         const gasPrice = (await provider.getGasPrice()).mul(110).div(100);
         const tx = await wallet.sendTransaction({ to: VAULT_ADDR, data, gasLimit: 500000, gasPrice });
-        await tx.wait();
+        console.log(chalk.gray(`[Acc ${idx + 1}] TX Hash: ${tx.hash}`));
+
+        const receipt = await tx.wait();
+        console.log(chalk.green(`[Acc ${idx + 1}] ${tokenName} RLP Vault Deposit confirmed! Block: ${receipt.blockNumber}`));
+
+        return true;
+    }, idx, 'dailyTask');
+}
+
+// Deposit to LaaS Vault (/governance page) - THIS IS WHAT DAILY TASK VERIFICATION CHECKS
+// LaaS Vault function: deposit(uint8 assetIdx, uint256 amount) where assetIdx: 0 = tUSDT, 1 = tUSDC
+async function depositLaaSVault(wallet, assetIdx, idx, amount, isFixed = true) {
+    // assetIdx: 0 = tUSDT, 1 = tUSDC (different from RLP Vault!)
+    const tokenAddr = assetIdx === 1 ? USDC_ADDR : USDT_ADDR;
+    const tokenName = assetIdx === 1 ? 'tUSDC' : 'tUSDT';
+    const decimals = assetIdx === 1 ? 6 : 18;
+
+    const bal = await getTokenBalance(wallet, tokenAddr);
+    const balFormatted = ethers.utils.formatUnits(bal, decimals);
+    console.log(chalk.gray(`[Acc ${idx + 1}] ${tokenName} Balance for LaaS: ${balFormatted}`));
+
+    let depositAmount;
+
+    if (isFixed) {
+        depositAmount = ethers.utils.parseUnits(amount.toString(), decimals);
+        if (bal.lt(depositAmount)) {
+            console.log(chalk.yellow(`[Acc ${idx + 1}] Insufficient ${tokenName} for LaaS: need ${amount}, have ${balFormatted}`));
+            return { success: true, result: 'skip_insufficient' };
+        }
+    } else {
+        depositAmount = bal;
+    }
+
+    const depositFormatted = ethers.utils.formatUnits(depositAmount, decimals);
+    console.log(chalk.cyan(`[Acc ${idx + 1}] Depositing ${depositFormatted} ${tokenName} to LaaS Vault (Governance)...`));
+
+    return await withRetry(async () => {
+        // Approve LaaS Vault
+        const approved = await ensureApproval(wallet, tokenAddr, LAAS_VAULT_ADDR);
+        if (!approved) throw new Error('LaaS Approval failed');
+
+        // LaaS Vault deposit function: deposit(uint8 assetIdx, uint256 amount)
+        // Function selector for deposit(uint8,uint256) = 0x47e7ef24 (need to verify)
+        // Actually, let's use the interface approach
+        const iface = new ethers.utils.Interface([
+            'function deposit(uint8 assetIdx, uint256 amount)'
+        ]);
+        const data = iface.encodeFunctionData('deposit', [assetIdx, depositAmount]);
+
+        console.log(chalk.gray(`[Acc ${idx + 1}] LaaS Vault TX: assetIdx=${assetIdx}, amount=${depositFormatted}`));
+
+        const gasPrice = (await provider.getGasPrice()).mul(110).div(100);
+        const tx = await wallet.sendTransaction({ to: LAAS_VAULT_ADDR, data, gasLimit: 500000, gasPrice });
+        console.log(chalk.gray(`[Acc ${idx + 1}] LaaS TX Hash: ${tx.hash}`));
+
+        const receipt = await tx.wait();
+        console.log(chalk.green(`[Acc ${idx + 1}] ${tokenName} LaaS Vault Deposit confirmed! Block: ${receipt.blockNumber}`));
+
         return true;
     }, idx, 'dailyTask');
 }
@@ -508,7 +588,8 @@ async function claimDiscordFaucet(account, idx) {
 const DAILY_QUIZ_STATE = {
     date: '',        // Format: YYYY-MM-DD
     answer: null,    // Correct answer if found
-    failed: []       // List of answers tried and failed
+    failed: [],      // List of answers tried and failed
+    quizData: null   // Cached quiz question data
 };
 
 function getQuizAnswerCandidate() {
@@ -519,20 +600,43 @@ function getQuizAnswerCandidate() {
         DAILY_QUIZ_STATE.date = today;
         DAILY_QUIZ_STATE.answer = null;
         DAILY_QUIZ_STATE.failed = [];
+        DAILY_QUIZ_STATE.quizData = null;
         console.log(chalk.magenta(`[QUIZ] New day detected (${today}). Resetting shared quiz memory.`));
     }
 
     // 1. If we know the answer, use it
-    if (DAILY_QUIZ_STATE.answer) {
+    if (DAILY_QUIZ_STATE.answer !== null) {
         return { answer: DAILY_QUIZ_STATE.answer, source: 'known_correct' };
     }
 
-    // 2. Find first integer not in failed list
-    let candidate = 1;
-    while (DAILY_QUIZ_STATE.failed.includes(candidate)) {
-        candidate++;
+    // 2. Quiz answers are typically 0-3 (for options A-D)
+    const possibleAnswers = [0, 1, 2, 3];
+    for (const candidate of possibleAnswers) {
+        if (!DAILY_QUIZ_STATE.failed.includes(candidate)) {
+            return { answer: candidate, source: 'guessing' };
+        }
     }
-    return { answer: candidate, source: 'guessing' };
+
+    // All failed, try 0 again
+    return { answer: 0, source: 'fallback' };
+}
+
+async function fetchDailyQuiz(client, addressLower) {
+    try {
+        // Try to get current quiz
+        const res = await client.get(`/rest/v1/daily_quizzes?select=*&order=created_at.desc&limit=1`);
+        if (res.data && res.data.length > 0) {
+            DAILY_QUIZ_STATE.quizData = res.data[0];
+            console.log(chalk.cyan(`[QUIZ] Today's Quiz: ${res.data[0].question || 'Unknown'}`));
+            if (res.data[0].options) {
+                console.log(chalk.gray(`[QUIZ] Options: ${JSON.stringify(res.data[0].options)}`));
+            }
+            return res.data[0];
+        }
+    } catch (e) {
+        console.log(chalk.yellow(`[QUIZ] Could not fetch quiz data: ${e.message}`));
+    }
+    return null;
 }
 
 async function processDailyQuiz(account, idx) {
@@ -543,30 +647,56 @@ async function processDailyQuiz(account, idx) {
     const wallet = new ethers.Wallet(account.privateKey, provider);
     const addressLower = wallet.address.toLowerCase();
 
-    return await withRetry(async () => {
+    // First, try to fetch quiz data
+    if (!DAILY_QUIZ_STATE.quizData) {
+        await fetchDailyQuiz(client, addressLower);
+    }
+
+    // Check if already completed
+    try {
+        const statusRes = await client.get(`/rest/v1/quiz_attempts?wallet_address=eq.${addressLower}&order=created_at.desc&limit=1`);
+        if (statusRes.data && statusRes.data.length > 0) {
+            const lastAttempt = statusRes.data[0];
+            const today = new Date().toISOString().split('T')[0];
+            if (lastAttempt.created_at?.startsWith(today) && lastAttempt.is_correct) {
+                state[idx].dailyQuiz = '✅';
+                console.log(chalk.green(`[Acc ${idx + 1}] Quiz already completed today!`));
+                return { success: true, result: 'already_done' };
+            }
+        }
+    } catch (e) {
+        console.log(chalk.gray(`[Acc ${idx + 1}] Could not check quiz status: ${e.message}`));
+    }
+
+    // Try up to 2 attempts (as shown in UI: 2/2 left)
+    for (let attempt = 0; attempt < 2; attempt++) {
         const { answer, source } = getQuizAnswerCandidate();
 
-        console.log(chalk.cyan(`[Acc ${idx + 1}] 🧠 Quiz Strategy: ${source === 'known_correct' ? 'Using known answer' : 'Collaborative guessing'} -> ${answer}`));
+        console.log(chalk.cyan(`[Acc ${idx + 1}] Quiz Attempt ${attempt + 1}/2: ${source} -> Answer: ${answer}`));
 
         try {
+            await sleep(antiDetect.requestJitter());
+
             const res = await client.post('/functions/v1/submit-quiz-answer', {
                 wallet_address: addressLower,
                 selected_answer: answer
             });
 
-            if (res.data?.correct) {
+            console.log(chalk.gray(`[Acc ${idx + 1}] Quiz Response: ${JSON.stringify(res.data)}`));
+
+            if (res.data?.correct === true || res.data?.is_correct === true) {
                 state[idx].dailyQuiz = '✅';
                 console.log(chalk.green(`[Acc ${idx + 1}] Quiz Correct! Answer: ${answer}`));
 
                 // Save for others
-                if (!DAILY_QUIZ_STATE.answer) {
+                if (DAILY_QUIZ_STATE.answer === null) {
                     DAILY_QUIZ_STATE.answer = answer;
-                    console.log(chalk.green.bold(`[QUIZ] 🎯 FOUND CORRECT ANSWER: ${answer} (Shared with all accounts)`));
+                    console.log(chalk.green.bold(`[QUIZ] FOUND CORRECT ANSWER: ${answer} (Shared with all accounts)`));
                 }
-                return true;
+                return { success: true, result: true };
             }
 
-            // If we are here, it was WRONG (or API error handled below)
+            // Wrong answer
             console.log(chalk.yellow(`[Acc ${idx + 1}] Quiz answer ${answer} incorrect.`));
 
             // Mark as failed so others don't try it
@@ -575,26 +705,41 @@ async function processDailyQuiz(account, idx) {
             }
 
             // Did API leak the correct answer?
-            if (res.data?.correct_answer) {
+            if (res.data?.correct_answer !== undefined) {
                 DAILY_QUIZ_STATE.answer = res.data.correct_answer;
-                console.log(chalk.magenta(`[QUIZ] 🕵️ API leaked correct answer: ${res.data.correct_answer}. Saved for others.`));
+                console.log(chalk.magenta(`[QUIZ] API leaked correct answer: ${res.data.correct_answer}. Saved for others.`));
             }
 
-            // Strict 1-shot (unless API says attempts_used < max)
-            if (res.data?.attempts_used < res.data?.max_attempts) {
-                throw new Error('Retrying with next guess...');
+            // Check remaining attempts
+            if (res.data?.attempts_remaining === 0 || res.data?.attempts_left === 0) {
+                console.log(chalk.red(`[Acc ${idx + 1}] No quiz attempts remaining.`));
+                state[idx].dailyQuiz = '❌';
+                return { success: false, error: 'No attempts left' };
             }
 
-            throw new Error(res.data?.message || 'Quiz failed');
+            await sleep(1000);
 
         } catch (e) {
-            if (e.response?.data?.message?.includes('already') || e.message?.includes('already')) {
+            const errMsg = e.response?.data?.message || e.message || '';
+
+            if (e.response?.status === 400 || errMsg.includes('400') || errMsg.includes('already') || errMsg.includes('completed')) {
                 state[idx].dailyQuiz = '✅';
-                return true;
+                console.log(chalk.green(`[Acc ${idx + 1}] Quiz already completed!`));
+                return { success: true, result: 'already_done' };
             }
-            throw e;
+
+            if (errMsg.includes('No attempts') || errMsg.includes('limit')) {
+                state[idx].dailyQuiz = '❌';
+                console.log(chalk.red(`[Acc ${idx + 1}] Quiz: ${errMsg}`));
+                return { success: false, error: errMsg };
+            }
+
+            console.log(chalk.red(`[Acc ${idx + 1}] Quiz error: ${errMsg}`));
         }
-    }, idx, 'dailyQuiz');
+    }
+
+    state[idx].dailyQuiz = '❌';
+    return { success: false, error: 'All attempts failed' };
 }
 
 // ============================================
@@ -636,33 +781,139 @@ async function processDailyTasks(account, idx) {
             task_id: 'daily-checkin',
             token_type: null
         });
+        console.log(chalk.gray(`[Acc ${idx + 1}] Check-in response: ${JSON.stringify(res.data)}`));
         if (res.data?.verified || res.data?.message?.includes('already')) return true;
         throw new Error(res.data?.message || 'Not verified');
     }, idx, 'dailyTask');
 
     await randomSleep();
 
-    // 4. Deposit to Vault
-    await depositVault(wallet, 1, idx);
-    await randomSleep();
-    await depositVault(wallet, 0, idx);
-    await randomSleep();
+    // ========== STEP 4: Deposit to RLP Vault (/vault) - THIS IS FOR DAILY TASK VERIFICATION ==========
+    // Based on verify.har: task_id = "daily-deposit-tusdt-1000" and "daily-deposit-tusdc-1000"
+    // These tasks verify deposits to the RLP Vault, NOT LaaS Vault
 
-    // 5. Verify deposit tasks
-    for (const task of [
-        { id: 'daily-deposit-tusdc-1000', type: 'tusdc' },
-        { id: 'daily-deposit-tusdt-1000', type: 'tusdt' }
-    ]) {
-        await withRetry(async () => {
+    console.log(chalk.cyan(`[Acc ${idx + 1}] === Depositing to RLP Vault (/vault) for Daily Task ==="`));
+
+    // Deposit 1000 tUSDC to RLP Vault (type = 1)
+    console.log(chalk.cyan(`[Acc ${idx + 1}] Depositing 1000 tUSDC to RLP Vault...`));
+    const usdcDepositResult = await depositVault(wallet, 1, idx, 1000, true);
+    console.log(chalk.gray(`[Acc ${idx + 1}] USDC Deposit result: ${JSON.stringify(usdcDepositResult)}`));
+
+    if (usdcDepositResult.success && usdcDepositResult.result !== 'skip_insufficient') {
+        await sleep(5000); // Wait for blockchain confirmation
+
+        // Verify USDC deposit with correct task_id
+        const verifyUsdcResult = await withRetry(async () => {
             const res = await client.post('/functions/v1/verify-deposit-task', {
                 wallet_address: addressLower,
-                task_id: task.id,
-                token_type: task.type
+                task_id: 'daily-deposit-tusdc-1000',
+                token_type: 'tusdc'
             });
-            return res.data?.verified;
+            console.log(chalk.gray(`[Acc ${idx + 1}] USDC Verify response: ${JSON.stringify(res.data)}`));
+            if (res.data?.verified || res.data?.success || res.data?.message?.includes('already')) return true;
+            throw new Error(res.data?.message || 'USDC verification failed');
         }, idx, 'dailyTask');
-        await randomSleep();
+        console.log(chalk.green(`[Acc ${idx + 1}] USDC deposit verified: ${verifyUsdcResult.success}`));
+    } else {
+        console.log(chalk.yellow(`[Acc ${idx + 1}] USDC deposit skipped (insufficient balance)`));
     }
+
+    await randomSleep();
+
+    // Deposit 1000 tUSDT to RLP Vault (type = 0)
+    console.log(chalk.cyan(`[Acc ${idx + 1}] Depositing 1000 tUSDT to RLP Vault...`));
+    const usdtDepositResult = await depositVault(wallet, 0, idx, 1000, true);
+    console.log(chalk.gray(`[Acc ${idx + 1}] USDT Deposit result: ${JSON.stringify(usdtDepositResult)}`));
+
+    if (usdtDepositResult.success && usdtDepositResult.result !== 'skip_insufficient') {
+        await sleep(5000); // Wait for blockchain confirmation
+
+        // Verify USDT deposit with correct task_id
+        const verifyUsdtResult = await withRetry(async () => {
+            const res = await client.post('/functions/v1/verify-deposit-task', {
+                wallet_address: addressLower,
+                task_id: 'daily-deposit-tusdt-1000',
+                token_type: 'tusdt'
+            });
+            console.log(chalk.gray(`[Acc ${idx + 1}] USDT Verify response: ${JSON.stringify(res.data)}`));
+            if (res.data?.verified || res.data?.success || res.data?.message?.includes('already')) return true;
+            throw new Error(res.data?.message || 'USDT verification failed');
+        }, idx, 'dailyTask');
+        console.log(chalk.green(`[Acc ${idx + 1}] USDT deposit verified: ${verifyUsdtResult.success}`));
+    } else {
+        console.log(chalk.yellow(`[Acc ${idx + 1}] USDT deposit skipped (insufficient balance)`));
+    }
+
+    await randomSleep();
+
+    // ========== STEP 5: Deposit to LaaS Vault (/governance) - ADDITIONAL DAILY TASK ==========
+    // Based on verify.har: task_id = "daily-laas-deposit-tusdt" and "daily-laas-deposit-tusdc"
+    // LaaS Vault requires: 500 tUSDC and 500 tUSDT for daily task
+
+    console.log(chalk.cyan(`[Acc ${idx + 1}] === Depositing to LaaS Vault (/governance) for Daily Task ==="`));
+
+    // Deposit 500 tUSDC to LaaS Vault (assetIdx = 1)
+    console.log(chalk.cyan(`[Acc ${idx + 1}] Depositing 500 tUSDC to LaaS Vault...`));
+    const laasUsdcResult = await depositLaaSVault(wallet, 1, idx, 500, true);
+    console.log(chalk.gray(`[Acc ${idx + 1}] LaaS USDC Deposit result: ${JSON.stringify(laasUsdcResult)}`));
+
+    if (laasUsdcResult.success && laasUsdcResult.result !== 'skip_insufficient') {
+        await sleep(5000); // Wait for blockchain confirmation
+
+        // Verify LaaS USDC deposit
+        const verifyLaasUsdcResult = await withRetry(async () => {
+            const res = await client.post('/functions/v1/verify-deposit-task', {
+                wallet_address: addressLower,
+                task_id: 'daily-laas-deposit-tusdc',
+                token_type: 'tusdc'
+            });
+            console.log(chalk.gray(`[Acc ${idx + 1}] LaaS USDC Verify response: ${JSON.stringify(res.data)}`));
+            if (res.data?.verified || res.data?.success || res.data?.message?.includes('already')) return true;
+            throw new Error(res.data?.message || 'LaaS USDC verification failed');
+        }, idx, 'dailyTask');
+        console.log(chalk.green(`[Acc ${idx + 1}] LaaS USDC deposit verified: ${verifyLaasUsdcResult.success}`));
+    } else {
+        console.log(chalk.yellow(`[Acc ${idx + 1}] LaaS USDC deposit skipped (insufficient balance)`));
+    }
+
+    await randomSleep();
+
+    // Deposit 500 tUSDT to LaaS Vault (assetIdx = 0)
+    console.log(chalk.cyan(`[Acc ${idx + 1}] Depositing 500 tUSDT to LaaS Vault...`));
+    const laasUsdtResult = await depositLaaSVault(wallet, 0, idx, 500, true);
+    console.log(chalk.gray(`[Acc ${idx + 1}] LaaS USDT Deposit result: ${JSON.stringify(laasUsdtResult)}`));
+
+    if (laasUsdtResult.success && laasUsdtResult.result !== 'skip_insufficient') {
+        await sleep(5000); // Wait for blockchain confirmation
+
+        // Verify LaaS USDT deposit
+        const verifyLaasUsdtResult = await withRetry(async () => {
+            const res = await client.post('/functions/v1/verify-deposit-task', {
+                wallet_address: addressLower,
+                task_id: 'daily-laas-deposit-tusdt',
+                token_type: 'tusdt'
+            });
+            console.log(chalk.gray(`[Acc ${idx + 1}] LaaS USDT Verify response: ${JSON.stringify(res.data)}`));
+            if (res.data?.verified || res.data?.success || res.data?.message?.includes('already')) return true;
+            throw new Error(res.data?.message || 'LaaS USDT verification failed');
+        }, idx, 'dailyTask');
+        console.log(chalk.green(`[Acc ${idx + 1}] LaaS USDT deposit verified: ${verifyLaasUsdtResult.success}`));
+    } else {
+        console.log(chalk.yellow(`[Acc ${idx + 1}] LaaS USDT deposit skipped (insufficient balance)`));
+    }
+
+    await randomSleep();
+
+    // 6. Verify duel task (if applicable)
+    await withRetry(async () => {
+        const res = await client.post('/functions/v1/verify-onchain-task', {
+            wallet_address: addressLower,
+            task_id: 'daily-duel-create'
+        });
+        console.log(chalk.gray(`[Acc ${idx + 1}] Duel task verify: ${JSON.stringify(res.data)}`));
+        return res.data?.verified;
+    }, idx, 'dailyTask');
+    await randomSleep();
 
     // 6. Daily Quiz
     await processDailyQuiz(account, idx);
@@ -749,16 +1000,26 @@ async function processDuel(account, idx) {
     const client = createClient(account.proxy);
     const addressLower = wallet.address.toLowerCase();
 
-    // 0. CHECK V2 LIMITS
+    // 0. CHECK IF DUEL IS ENABLED
+    if (account.duelEnabled === false) {
+        state[idx].duelStatus = '⛔ Off';
+        return;
+    }
+
+    // 0.1 CHECK V2 LIMITS & VOLUME
     const now = Date.now();
-    // Filter history for current day
     const today = new Date().setHours(0, 0, 0, 0);
+
+    // Filter history for current day
     state[idx].duelHistory = state[idx].duelHistory.filter(h => h.timestamp > today);
     state[idx].dailyDuelCount = state[idx].duelHistory.length;
 
-    if (state[idx].dailyDuelCount >= DAILY_DUEL_LIMIT) {
+    const isLimitReached = state[idx].dailyDuelCount >= DAILY_DUEL_LIMIT;
+
+    if (isLimitReached) {
         state[idx].duelStatus = '✅Limit';
         state[idx].nextDuel = getNextDailySchedule();
+        console.log(chalk.green(`[Acc ${idx + 1}] 🏁 Daily Target Reached! (Duels: ${state[idx].dailyDuelCount}/10)`));
         return;
     }
 
@@ -777,67 +1038,87 @@ async function processDuel(account, idx) {
             const iface = new ethers.utils.Interface(DUEL_ABI);
             const data = iface.encodeFunctionData('claimPrize', [duel.id]);
             const gasPrice = (await provider.getGasPrice()).mul(110).div(100);
-            const tx = await wallet.sendTransaction({ to: DUEL_ADDR, data, gasLimit: 500000, gasPrice }); // 500k is enough for claim
+            const tx = await wallet.sendTransaction({ to: DUEL_ADDR, data, gasLimit: 500000, gasPrice });
             await tx.wait();
             return true;
         }, idx, 'duelStatus');
         await randomSleep();
     }
 
-    // 2. Try to accept or create duels (Run 3x)
-    for (let i = 0; i < 3; i++) {
-        console.log(chalk.cyan(`[Acc ${idx + 1}] ⚔️ Executing Duel Logic Iteration ${i + 1}/3...`));
+    // ONCE PER DAY DUEL LOGIC - Only do 1 action (accept OR create) to avoid CALL_EXCEPTION
+    console.log(chalk.cyan(`[Acc ${idx + 1}] ⚔️ Daily Duel (1x per day mode)...`));
 
-        // Re-check rate limit inside loop
-        if (state[idx].duelHistory.filter(h => Date.now() - h.timestamp < RATE_LIMIT_WINDOW).length >= RATE_LIMIT_DUELS) {
-            console.log(chalk.yellow(`[Acc ${idx + 1}] ⏳ Rate limit reached, skipping iteration.`));
-            break;
+    let duelCompleted = false;
+
+    // Try to accept ONE open duel first
+    const openDuels = await getOpenDuels(wallet);
+    console.log(chalk.gray(`[Acc ${idx + 1}] 🔍 Found ${openDuels.length} open duels`));
+
+    // Sort by lowest wager first
+    openDuels.sort((a, b) => {
+        const aDecimals = a.wagerToken.toLowerCase() === USDC_ADDR.toLowerCase() ? 6 : 18;
+        const bDecimals = b.wagerToken.toLowerCase() === USDC_ADDR.toLowerCase() ? 6 : 18;
+        const aAmt = parseFloat(ethers.utils.formatUnits(a.wagerAmount, aDecimals));
+        const bAmt = parseFloat(ethers.utils.formatUnits(b.wagerAmount, bDecimals));
+        return aAmt - bAmt;
+    });
+
+    for (const duel of openDuels) {
+        if (duelCompleted) break; // Only 1 duel per day
+
+        const isUSDC = duel.wagerToken.toLowerCase() === USDC_ADDR.toLowerCase();
+        const tokenAddr = isUSDC ? USDC_ADDR : USDT_ADDR;
+        const decimals = isUSDC ? 6 : 18;
+        const amount = parseFloat(ethers.utils.formatUnits(duel.wagerAmount, decimals));
+
+        if (amount > 500) continue;
+
+        const balance = await getTokenBalance(wallet, tokenAddr);
+        if (balance.lt(duel.wagerAmount)) continue;
+
+        const opponentCount = state[idx].duelHistory.filter(h => h.opponent.toLowerCase() === duel.challenger.toLowerCase()).length;
+        if (opponentCount >= SAME_OPPONENT_LIMIT) continue;
+
+        console.log(chalk.cyan(`[Acc ${idx + 1}] 🎯 Accepting duel #${duel.id} (${amount} ${isUSDC ? 'USDC' : 'USDT'})...`));
+
+        const result = await withRetry(async () => {
+            const approved = await ensureApproval(wallet, tokenAddr, DUEL_ADDR);
+            if (!approved) throw new Error('Approval failed');
+            const iface = new ethers.utils.Interface(DUEL_ABI);
+            const data = iface.encodeFunctionData('acceptDuel', [duel.id]);
+            const gasPrice = (await provider.getGasPrice()).mul(110).div(100);
+            const tx = await wallet.sendTransaction({ to: DUEL_ADDR, data, gasLimit: 1000000, gasPrice });
+            await tx.wait();
+            return true;
+        }, idx, 'duelStatus');
+
+        if (result.success) {
+            duelCompleted = true;
+            state[idx].duelHistory.push({ timestamp: Date.now(), opponent: duel.challenger, amount: amount });
+            console.log(chalk.green(`[Acc ${idx + 1}] ✅ Duel accepted! Waiting for resolution...`));
         }
+    }
 
-        let processed = false;
+    // Only create if no duel accepted AND no open duels from others
+    if (!duelCompleted && openDuels.filter(d => d.challenger.toLowerCase() !== addressLower).length === 0) {
+        const useUSDC = Math.random() < 0.5;
+        const tokenAddr = useUSDC ? USDC_ADDR : USDT_ADDR;
+        const decimals = useUSDC ? 6 : 18;
 
-        // Try to accept open duels (Limit to < $500 to avoid whales/instant limit hit)
-        const openDuels = await getOpenDuels(wallet);
-        console.log(chalk.gray(`[Acc ${idx + 1}] 🔍 Found ${openDuels.length} open duels`));
+        const balance = await getTokenBalance(wallet, tokenAddr);
+        const minWager = ethers.utils.parseUnits("400", decimals);
 
-        openDuels.sort((a, b) => {
-            const aDecimals = a.wagerToken.toLowerCase() === USDC_ADDR.toLowerCase() ? 6 : 18;
-            const bDecimals = b.wagerToken.toLowerCase() === USDC_ADDR.toLowerCase() ? 6 : 18;
-            const aAmt = parseFloat(ethers.utils.formatUnits(a.wagerAmount, aDecimals));
-            const bAmt = parseFloat(ethers.utils.formatUnits(b.wagerAmount, bDecimals));
-            return aAmt - bAmt;
-        });
+        if (balance.gte(minWager)) {
+            const rawAmount = randomDelay(400, 450);
+            const wagerAmount = ethers.utils.parseUnits(rawAmount.toString(), decimals);
 
-        for (const duel of openDuels) {
-            const isUSDC = duel.wagerToken.toLowerCase() === USDC_ADDR.toLowerCase();
-            const tokenAddr = isUSDC ? USDC_ADDR : USDT_ADDR;
-            const decimals = isUSDC ? 6 : 18;
-            const amount = parseFloat(ethers.utils.formatUnits(duel.wagerAmount, decimals));
-
-            // Strategy: Skip whales
-            if (amount > 500) {
-                console.log(chalk.gray(`[Acc ${idx + 1}] ⏭️ Skipping duel ${duel.id}: Amount ${amount} > 500`));
-                continue;
-            }
-
-            const balance = await getTokenBalance(wallet, tokenAddr);
-            if (balance.lt(duel.wagerAmount)) {
-                console.log(chalk.gray(`[Acc ${idx + 1}] ⏭️ Skipping duel ${duel.id}: Low balance (${ethers.utils.formatUnits(balance, decimals)} < ${amount})`));
-                continue;
-            }
-
-            // CHECK OPPONENT LIMIT (Max 3/day)
-            const opponentCount = state[idx].duelHistory.filter(h => h.opponent.toLowerCase() === duel.challenger.toLowerCase()).length;
-            if (opponentCount >= SAME_OPPONENT_LIMIT) {
-                console.log(chalk.yellow(`[Acc ${idx + 1}] 🚫 Skipping opponent ${duel.challenger.slice(0, 6)} (Max fights reached)`));
-                continue;
-            }
+            console.log(chalk.cyan(`[Acc ${idx + 1}] 🗡️ Creating duel (${rawAmount} ${useUSDC ? 'USDC' : 'USDT'})...`));
 
             const result = await withRetry(async () => {
                 const approved = await ensureApproval(wallet, tokenAddr, DUEL_ADDR);
                 if (!approved) throw new Error('Approval failed');
                 const iface = new ethers.utils.Interface(DUEL_ABI);
-                const data = iface.encodeFunctionData('acceptDuel', [duel.id]);
+                const data = iface.encodeFunctionData('createDuel', [wagerAmount, tokenAddr, 0]);
                 const gasPrice = (await provider.getGasPrice()).mul(110).div(100);
                 const tx = await wallet.sendTransaction({ to: DUEL_ADDR, data, gasLimit: 1000000, gasPrice });
                 await tx.wait();
@@ -845,75 +1126,26 @@ async function processDuel(account, idx) {
             }, idx, 'duelStatus');
 
             if (result.success) {
-                processed = true;
-                state[idx].duelHistory.push({ timestamp: Date.now(), opponent: duel.challenger });
-                break;
-            } else {
-                console.log(chalk.red(`[Acc ${idx + 1}] ❌ Accept Failed: ${result.error?.message || 'Unknown error'}`));
-                if (result.error?.message?.includes('daily limit') || result.error?.message?.includes('limit reached')) {
-                    state[idx].duelStatus = '✅Limit';
-                    state[idx].nextDuel = getNextDailySchedule();
-                    return; // Stop dueling for this account today
-                }
-            }
-            await randomSleep();
-        }
-
-        // If no duels to accept, create one
-        if (!processed && openDuels.filter(d => d.challenger.toLowerCase() !== addressLower).length === 0) {
-            const useUSDC = Math.random() < 0.5;
-            const tokenAddr = useUSDC ? USDC_ADDR : USDT_ADDR;
-            const decimals = useUSDC ? 6 : 18;
-
-            const balance = await getTokenBalance(wallet, tokenAddr);
-            // Strategy: Target $420/hour to hit $10k/day evenly
-            const minWager = ethers.utils.parseUnits("400", decimals);
-
-            console.log(chalk.gray(`[Acc ${idx + 1}] ⚖️ Creation Balance Check: ${ethers.utils.formatUnits(balance, decimals)} ${useUSDC ? 'USDC' : 'USDT'} (Min: 400)`));
-
-            if (balance.gte(minWager)) {
-                // Target 400-450 range
-                const rawAmount = randomDelay(400, 450);
-                const wagerAmount = ethers.utils.parseUnits(rawAmount.toString(), decimals);
-
-                if (balance.lt(wagerAmount)) {
-                    console.log(chalk.yellow(`[Acc ${idx + 1}] ⚠️ Balance low for optimal wager, skipping creation.`));
-                    continue;
-                }
-
-                const result = await withRetry(async () => {
-                    const approved = await ensureApproval(wallet, tokenAddr, DUEL_ADDR);
-                    if (!approved) throw new Error('Approval failed');
-                    const iface = new ethers.utils.Interface(DUEL_ABI);
-                    const data = iface.encodeFunctionData('createDuel', [wagerAmount, tokenAddr, 0]);
-                    const gasPrice = (await provider.getGasPrice()).mul(110).div(100);
-                    const tx = await wallet.sendTransaction({ to: DUEL_ADDR, data, gasLimit: 1000000, gasPrice });
-                    await tx.wait();
-                    return true;
-                }, idx, 'duelStatus');
-
-                if (result.success) {
-                    processed = true;
-                    // For created duels, we don't know the opponent yet, so we just track the action timestamp
-                    // We can use a placeholder opponent or just track it for rate limit
-                    state[idx].duelHistory.push({ timestamp: Date.now(), opponent: 'unknown_created' });
-                } else {
-                    console.log(chalk.red(`[Acc ${idx + 1}] ❌ Create Failed: ${result.error?.message || 'Unknown error'}`));
-                    if (result.error?.message?.includes('daily limit') || result.error?.message?.includes('limit reached')) {
-                        state[idx].duelStatus = '✅Limit';
-                        state[idx].nextDuel = getNextDailySchedule();
-                        return; // Stop dueling
-                    }
-                }
+                duelCompleted = true;
+                state[idx].duelHistory.push({ timestamp: Date.now(), opponent: 'unknown_created', amount: rawAmount });
+                console.log(chalk.green(`[Acc ${idx + 1}] ✅ Duel created! Waiting for opponent...`));
             }
         }
-
-        if (i < 2) await sleep(5000 + Math.random() * 5000); // Wait 5-10s between iterations
     }
 
-    // 3. Deposit max to vault for advantage (Reserve 100-500)
+    // Log daily summary
+    console.log(chalk.gray(`[Acc ${idx + 1}] 📅 Daily duel completed: ${duelCompleted ? 'Yes' : 'No action taken'}`));
+
+    const { dailyDuelCount } = state[idx];
+    // Recheck limits after actions
+    if (dailyDuelCount >= DAILY_DUEL_LIMIT) {
+        state[idx].duelStatus = '✅Limit';
+        state[idx].nextDuel = getNextDailySchedule();
+        return;
+    }
+
+    // 3. Deposit max
     const reserve = randomDelay(100, 500);
-    console.log(chalk.cyan(`[Acc ${idx + 1}] 🏦 Max Deposit Active (Reserved: ${reserve} tokens)`));
     await depositVault(wallet, 1, idx, reserve);
     await depositVault(wallet, 0, idx, reserve);
 
@@ -921,15 +1153,67 @@ async function processDuel(account, idx) {
     await withRetry(async () => {
         const res = await client.post('/functions/v1/verify-onchain-task', {
             wallet_address: addressLower,
-            task_id: 'daily-duel-create'
+            task_id: 'daily-duelist'
         });
         return res.data?.verified;
     }, idx, 'duelStatus');
 
     state[idx].duelStatus = '✅';
     state[idx].lastDuel = Date.now();
-    // Dynamic Scheduling: If not limited, run aggressively (10-30s)
     state[idx].nextDuel = new Date(Date.now() + randomDelay(10000, 30000));
+}
+
+// ============================================
+// STATE SYNC
+// ============================================
+
+async function syncDailyStats(account, idx) {
+    state[idx].duelStatus = '🔄Sync';
+    renderDashboard();
+
+    const wallet = new ethers.Wallet(account.privateKey, provider);
+    const today = new Date().setHours(0, 0, 0, 0);
+
+    try {
+        const contract = new ethers.Contract(DUEL_ADDR, DUEL_ABI, wallet);
+        const userDuelIds = await contract.getUserDuels(wallet.address);
+
+        // Check last 20 duels (simpler than fetching all)
+        const recentIds = userDuelIds.slice(-20);
+        const history = [];
+
+        for (const idBN of recentIds) {
+            const duel = await getDuelById(wallet, idBN.toNumber());
+            if (duel && duel.createdAt * 1000 > today) {
+                // Determine amount in USD (approx)
+                const isUSDC = duel.wagerToken.toLowerCase() === USDC_ADDR.toLowerCase();
+                const decimals = isUSDC ? 6 : 18;
+                const amount = parseFloat(ethers.utils.formatUnits(duel.wagerAmount, decimals));
+
+                history.push({
+                    timestamp: duel.createdAt * 1000,
+                    opponent: duel.opponent.toLowerCase() === wallet.address.toLowerCase() ? duel.challenger : duel.opponent,
+                    amount: amount
+                });
+            }
+        }
+
+        state[idx].duelHistory = history;
+        state[idx].dailyDuelCount = history.length;
+
+        const isLimitReached = state[idx].dailyDuelCount >= DAILY_DUEL_LIMIT;
+
+        state[idx].duelStatus = isLimitReached ? '✅Limit' : '⏳';
+
+        if (state[idx].duelStatus.startsWith('✅')) {
+            state[idx].nextDuel = getNextDailySchedule();
+        }
+
+        console.log(chalk.blue(`[Acc ${idx + 1}] 🔄 Synced: ${state[idx].dailyDuelCount} duels.`));
+
+    } catch (e) {
+        console.log(chalk.red(`[Acc ${idx + 1}] ❌ Sync Failed: ${e.message}`));
+    }
 }
 
 // ============================================
@@ -937,12 +1221,22 @@ async function processDuel(account, idx) {
 // ============================================
 
 async function main() {
+    // Initialize State
     accounts.forEach((_, i) => {
         state[i] = createState(i);
-        // Force immediate check on startup (set to 1 min ago), then it will sync to 14:00
-        state[i].nextDaily = new Date(Date.now() - 60000);
+        state[i].nextDaily = new Date(Date.now() - 60000); // Force check
         state[i].nextDuel = new Date(Date.now() + randomDelay(5000, 30000));
     });
+
+    renderDashboard();
+
+    // Initial Sync
+    console.log(chalk.yellow('🔄 Syncing daily stats from blockchain...'));
+    for (let i = 0; i < accounts.length; i++) {
+        await syncDailyStats(accounts[i], i);
+    }
+    console.log(chalk.green('✅ Sync complete. Starting main loop...'));
+    await sleep(2000);
 
     renderDashboard();
 
@@ -955,7 +1249,7 @@ async function main() {
 
             if (s.isProcessing) continue;
 
-            // 1. DAILY TASKS + WEB FAUCET (14:00 WIB)
+            // 1. DAILY TASKS + WEB FAUCET (21:00 WIB)
             if (s.nextDaily && now >= s.nextDaily.getTime()) {
                 s.isProcessing = true;
                 try {
