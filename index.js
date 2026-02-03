@@ -135,7 +135,8 @@ const createState = (index) => ({
     lastDuel: 0,
     isProcessing: false,
     duelHistory: [], // Array of { timestamp, opponent, amount }
-    dailyDuelCount: 0
+    dailyDuelCount: 0,
+    duelFailures: 0
 });
 
 // ============================================
@@ -1019,7 +1020,7 @@ async function processDuel(account, idx) {
     if (isLimitReached) {
         state[idx].duelStatus = '✅Limit';
         state[idx].nextDuel = getNextDailySchedule();
-        console.log(chalk.green(`[Acc ${idx + 1}] 🏁 Daily Target Reached! (Duels: ${state[idx].dailyDuelCount}/10)`));
+        console.log(chalk.green(`[Acc ${idx + 1}] 🏁 Daily Target Reached! (Duels: ${state[idx].dailyDuelCount}/1)`));
         return;
     }
 
@@ -1045,12 +1046,14 @@ async function processDuel(account, idx) {
         await randomSleep();
     }
 
-    // ONCE PER DAY DUEL LOGIC - Only do 1 action (accept OR create) to avoid CALL_EXCEPTION
-    console.log(chalk.cyan(`[Acc ${idx + 1}] ⚔️ Daily Duel (1x per day mode)...`));
+    // NEW STRATEGY: Try to Join 3x -> If fail, Create 1x (with 3 retries)
+    console.log(chalk.cyan(`[Acc ${idx + 1}] ⚔️ Daily Duel Strategy: Try Join 3x -> Fallback Create...`));
 
     let duelCompleted = false;
+    let joinAttempts = 0;
+    const MAX_JOIN_ATTEMPTS = 3;
 
-    // Try to accept ONE open duel first
+    // A. TRY TO JOIN EXISTING DUELS
     const openDuels = await getOpenDuels(wallet);
     console.log(chalk.gray(`[Acc ${idx + 1}] 🔍 Found ${openDuels.length} open duels`));
 
@@ -1064,7 +1067,11 @@ async function processDuel(account, idx) {
     });
 
     for (const duel of openDuels) {
-        if (duelCompleted) break; // Only 1 duel per day
+        if (duelCompleted) break;
+        if (joinAttempts >= MAX_JOIN_ATTEMPTS) {
+            console.log(chalk.yellow(`[Acc ${idx + 1}] ⚠️ Reached max join attempts (${MAX_JOIN_ATTEMPTS}). Switching to Create Mode...`));
+            break;
+        }
 
         const isUSDC = duel.wagerToken.toLowerCase() === USDC_ADDR.toLowerCase();
         const tokenAddr = isUSDC ? USDC_ADDR : USDT_ADDR;
@@ -1074,73 +1081,137 @@ async function processDuel(account, idx) {
         if (amount > 500) continue;
 
         const balance = await getTokenBalance(wallet, tokenAddr);
-        if (balance.lt(duel.wagerAmount)) continue;
+        if (balance.lt(duel.wagerAmount)) {
+            console.log(chalk.yellow(`[Acc ${idx + 1}] ⚠️ Insufficient balance to join duel #${duel.id} (${amount} ${isUSDC ? 'USDC' : 'USDT'}).`));
+            continue;
+        }
 
         const opponentCount = state[idx].duelHistory.filter(h => h.opponent.toLowerCase() === duel.challenger.toLowerCase()).length;
         if (opponentCount >= SAME_OPPONENT_LIMIT) continue;
 
-        console.log(chalk.cyan(`[Acc ${idx + 1}] 🎯 Accepting duel #${duel.id} (${amount} ${isUSDC ? 'USDC' : 'USDT'})...`));
+        console.log(chalk.cyan(`[Acc ${idx + 1}] 🎯 Attempting join duel #${duel.id} (${amount} ${isUSDC ? 'USDC' : 'USDT'})...`));
+        joinAttempts++;
 
         const result = await withRetry(async () => {
             const approved = await ensureApproval(wallet, tokenAddr, DUEL_ADDR);
             if (!approved) throw new Error('Approval failed');
             const iface = new ethers.utils.Interface(DUEL_ABI);
             const data = iface.encodeFunctionData('acceptDuel', [duel.id]);
+
+            // Simulate first to avoid failed transactions (CALL_EXCEPTION)
+            try {
+                const contract = new ethers.Contract(DUEL_ADDR, DUEL_ABI, wallet);
+                await contract.callStatic.acceptDuel(duel.id);
+            } catch (simError) {
+                console.log(chalk.yellow(`[Acc ${idx + 1}] ⚠️ Join Simulation failed for duel #${duel.id} (Likely taken or Daily Limit Reached).`));
+                return false; // Skip this duel
+            }
+
             const gasPrice = (await provider.getGasPrice()).mul(110).div(100);
-            const tx = await wallet.sendTransaction({ to: DUEL_ADDR, data, gasLimit: 1000000, gasPrice });
-            await tx.wait();
-            return true;
+            try {
+                const tx = await wallet.sendTransaction({ to: DUEL_ADDR, data, gasLimit: 1000000, gasPrice });
+                await tx.wait();
+                return true;
+            } catch (txError) {
+                console.log(chalk.red(`[Acc ${idx + 1}] ❌ Duel Join TX Failed: ${txError.reason || txError.message}`));
+                throw txError;
+            }
         }, idx, 'duelStatus');
 
-        if (result.success) {
+        if (result.success && result.result === true) {
             duelCompleted = true;
             state[idx].duelHistory.push({ timestamp: Date.now(), opponent: duel.challenger, amount: amount });
             console.log(chalk.green(`[Acc ${idx + 1}] ✅ Duel accepted! Waiting for resolution...`));
         }
     }
 
-    // Only create if no duel accepted AND no open duels from others
-    if (!duelCompleted && openDuels.filter(d => d.challenger.toLowerCase() !== addressLower).length === 0) {
+    // B. FALLBACK: CREATE DUEL if not completed
+    if (!duelCompleted) {
+        if (openDuels.length > 0 && joinAttempts < MAX_JOIN_ATTEMPTS) {
+            // We didn't try enough joins yet, but loop finished? (Maybe filtered out?)
+            // Just fallthrough to create.
+        }
+
+        console.log(chalk.cyan(`[Acc ${idx + 1}] 🆕 Switching to CREATE DUEL Mode (Fallback)...`));
+
         const useUSDC = Math.random() < 0.5;
         const tokenAddr = useUSDC ? USDC_ADDR : USDT_ADDR;
         const decimals = useUSDC ? 6 : 18;
-
         const balance = await getTokenBalance(wallet, tokenAddr);
         const minWager = ethers.utils.parseUnits("400", decimals);
 
         if (balance.gte(minWager)) {
-            const rawAmount = randomDelay(400, 450);
-            const wagerAmount = ethers.utils.parseUnits(rawAmount.toString(), decimals);
+            // Retry loop for Creation
+            for (let createAttempt = 1; createAttempt <= 3; createAttempt++) {
+                if (duelCompleted) break;
 
-            console.log(chalk.cyan(`[Acc ${idx + 1}] 🗡️ Creating duel (${rawAmount} ${useUSDC ? 'USDC' : 'USDT'})...`));
+                const rawAmount = randomDelay(400, 450);
+                const wagerAmount = ethers.utils.parseUnits(rawAmount.toString(), decimals);
 
-            const result = await withRetry(async () => {
-                const approved = await ensureApproval(wallet, tokenAddr, DUEL_ADDR);
-                if (!approved) throw new Error('Approval failed');
-                const iface = new ethers.utils.Interface(DUEL_ABI);
-                const data = iface.encodeFunctionData('createDuel', [wagerAmount, tokenAddr, 0]);
-                const gasPrice = (await provider.getGasPrice()).mul(110).div(100);
-                const tx = await wallet.sendTransaction({ to: DUEL_ADDR, data, gasLimit: 1000000, gasPrice });
-                await tx.wait();
-                return true;
-            }, idx, 'duelStatus');
+                console.log(chalk.cyan(`[Acc ${idx + 1}] 🗡️ Creating duel (Attempt ${createAttempt}/3) - ${rawAmount} ${useUSDC ? 'USDC' : 'USDT'}...`));
 
-            if (result.success) {
-                duelCompleted = true;
-                state[idx].duelHistory.push({ timestamp: Date.now(), opponent: 'unknown_created', amount: rawAmount });
-                console.log(chalk.green(`[Acc ${idx + 1}] ✅ Duel created! Waiting for opponent...`));
+                const result = await withRetry(async () => {
+                    const approved = await ensureApproval(wallet, tokenAddr, DUEL_ADDR);
+                    if (!approved) throw new Error('Approval failed');
+                    const iface = new ethers.utils.Interface(DUEL_ABI);
+                    const data = iface.encodeFunctionData('createDuel', [wagerAmount, tokenAddr, 0]);
+
+                    // Simulate first to avoid failed transactions (CALL_EXCEPTION)
+                    try {
+                        const contract = new ethers.Contract(DUEL_ADDR, DUEL_ABI, wallet);
+                        await contract.callStatic.createDuel(wagerAmount, tokenAddr, 0);
+                    } catch (simError) {
+                        console.log(chalk.red(`[Acc ${idx + 1}] ⚠️ Create Simulation failed (Likely Daily Limit Reached). Stopping...`));
+                        return 'SIMULATION_FAILED'; // Special return to break loop
+                    }
+
+                    const gasPrice = (await provider.getGasPrice()).mul(110).div(100);
+
+                    try {
+                        const tx = await wallet.sendTransaction({ to: DUEL_ADDR, data, gasLimit: 1000000, gasPrice });
+                        await tx.wait();
+                        return true;
+                    } catch (txError) {
+                        console.log(chalk.red(`[Acc ${idx + 1}] ❌ Create TX Failed: ${txError.reason || txError.message}`));
+                        throw txError;
+                    }
+                }, idx, 'duelStatus');
+
+                if (result === 'SIMULATION_FAILED') {
+                    state[idx].duelStatus = '✅Limit';
+                    duelCompleted = false;
+                    break; // Stop retrying
+                }
+
+                if (result && result.success && result.result === true) {
+                    duelCompleted = true;
+                    state[idx].duelHistory.push({ timestamp: Date.now(), opponent: 'unknown_created', amount: rawAmount });
+                    console.log(chalk.green(`[Acc ${idx + 1}] ✅ Duel created! Waiting for opponent...`));
+                } else {
+                    await sleep(3000); // Wait before retry
+                }
             }
+        } else {
+            console.log(chalk.yellow(`[Acc ${idx + 1}] ⚠️ Insufficient balance to create duel (Needed: ~400 ${useUSDC ? 'USDC' : 'USDT'}).`));
         }
     }
 
     // Log daily summary
-    console.log(chalk.gray(`[Acc ${idx + 1}] 📅 Daily duel completed: ${duelCompleted ? 'Yes' : 'No action taken'}`));
+    console.log(chalk.gray(`[Acc ${idx + 1}] 📅 Daily duel result: ${duelCompleted ? 'Success' : 'Failed'}`));
 
     const { dailyDuelCount } = state[idx];
     // Recheck limits after actions
     if (dailyDuelCount >= DAILY_DUEL_LIMIT) {
         state[idx].duelStatus = '✅Limit';
         state[idx].nextDuel = getNextDailySchedule();
+        return;
+    }
+
+    // If we failed everything, set a delay and return (skip to next account logic handled by loop)
+    if (!duelCompleted) {
+        state[idx].duelStatus = '❌Fail';
+        state[idx].nextDuel = new Date(Date.now() + 4 * 60 * 60 * 1000); // Retry in 4 hours if failed
+        console.log(chalk.yellow(`[Acc ${idx + 1}] ⏳ Duel failed today. Retrying in 4 hours.`));
         return;
     }
 
