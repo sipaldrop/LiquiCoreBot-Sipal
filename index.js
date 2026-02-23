@@ -21,7 +21,7 @@ const config = {
     retryDelay: 3000,
 
     // SCHEDULE CONFIG
-    dailyHour: 9,        // 09:00 WIB (9 AM)
+    dailyHour: 8,        // 08:00 WIB (8 AM)
     dailyMinute: 0,
     discordInterval: 30 * 60 * 1000, // 30 minutes
     duelInterval: 5 * 60 * 60 * 1000, // 5 hours
