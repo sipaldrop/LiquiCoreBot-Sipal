@@ -482,22 +482,17 @@ async function depositVault(wallet, type, idx, amount = 550, isFixed = false) {
     const balFormatted = ethers.utils.formatUnits(bal, decimals);
     console.log(chalk.gray(`[Acc ${idx + 1}] ${tokenName} Balance: ${balFormatted}`));
 
-    let depositAmount;
-
-    if (isFixed) {
-        depositAmount = ethers.utils.parseUnits(amount.toString(), decimals);
-        if (bal.lt(depositAmount)) {
-            console.log(chalk.yellow(`[Acc ${idx + 1}] Insufficient ${tokenName}: need ${amount}, have ${balFormatted}`));
-            return { success: true, result: 'skip_insufficient' };
-        }
-    } else {
-        const reserve = ethers.utils.parseUnits(amount.toString(), decimals);
-        if (bal.lte(reserve)) {
-            console.log(chalk.yellow(`[Acc ${idx + 1}] ${tokenName} balance too low for reserve`));
-            return { success: true, result: 'skip' };
-        }
-        depositAmount = bal.sub(reserve);
+    // S1 Badge: "First Deposit" requires deposit on 2 different days
+    // Deposit whatever is available (consistency > amount)
+    const minAmount = ethers.utils.parseUnits('1', decimals); // at least 1 token
+    if (bal.lt(minAmount)) {
+        console.log(chalk.yellow(`[Acc ${idx + 1}] ${tokenName} balance too low (< 1), skipping RLP deposit`));
+        return { success: true, result: 'skip_insufficient' };
     }
+
+    // Deposit up to target amount, or all available if less
+    const targetAmount = ethers.utils.parseUnits(amount.toString(), decimals);
+    let depositAmount = bal.lt(targetAmount) ? bal : targetAmount;
 
     const depositFormatted = ethers.utils.formatUnits(depositAmount, decimals);
     console.log(chalk.cyan(`[Acc ${idx + 1}] Depositing ${depositFormatted} ${tokenName} to RLP Vault...`));
@@ -535,17 +530,15 @@ async function depositLaaSVault(wallet, assetIdx, idx, amount, isFixed = true) {
     const balFormatted = ethers.utils.formatUnits(bal, decimals);
     console.log(chalk.gray(`[Acc ${idx + 1}] ${tokenName} Balance for LaaS: ${balFormatted}`));
 
-    let depositAmount;
-
-    if (isFixed) {
-        depositAmount = ethers.utils.parseUnits(amount.toString(), decimals);
-        if (bal.lt(depositAmount)) {
-            console.log(chalk.yellow(`[Acc ${idx + 1}] Insufficient ${tokenName} for LaaS: need ${amount}, have ${balFormatted}`));
-            return { success: true, result: 'skip_insufficient' };
-        }
-    } else {
-        depositAmount = bal;
+    // S1 Badge: LP badges require holding LP tokens — deposit whatever available
+    const minAmount = ethers.utils.parseUnits('1', decimals);
+    if (bal.lt(minAmount)) {
+        console.log(chalk.yellow(`[Acc ${idx + 1}] ${tokenName} balance too low (< 1), skipping LaaS deposit`));
+        return { success: true, result: 'skip_insufficient' };
     }
+
+    const targetAmount = ethers.utils.parseUnits(amount.toString(), decimals);
+    let depositAmount = bal.lt(targetAmount) ? bal : targetAmount;
 
     const depositFormatted = ethers.utils.formatUnits(depositAmount, decimals);
     console.log(chalk.cyan(`[Acc ${idx + 1}] Depositing ${depositFormatted} ${tokenName} to LaaS Vault (Governance)...`));
@@ -845,8 +838,21 @@ async function processGovernanceVote(account, idx) {
     const POOLS = [0, 1, 2, 3]; // Pool A, B, C, D
     let voteCount = 0;
 
-    for (let i = 0; i < 5; i++) {
-        const poolId = POOLS[Math.floor(Math.random() * POOLS.length)];
+    // S1 Badge Strategy:
+    // "First Vote": vote on 2+ different days (+50 LIQ)
+    // "Active Voter": vote for 3+ different pools (+60 LIQ)
+    // "Triple Voter": vote ALL 3 pools in a single day (+60 LIQ)
+    // "Daily Activist": 5+ votes per day (+60 LIQ)
+    // "Voting Streak": vote 5 consecutive days (+90 LIQ)
+    //
+    // Strategy: Vote ALL 3 pools first (0,1,2), then 2 more random = 5 total
+
+    // Build vote plan: pools 0,1,2 first, then 2 random
+    const votePlan = [0, 1, 2, POOLS[Math.floor(Math.random() * POOLS.length)], POOLS[Math.floor(Math.random() * POOLS.length)]];
+    let notEligibleCount = 0;
+
+    for (let i = 0; i < votePlan.length; i++) {
+        const poolId = votePlan[i];
         const poolName = ['Pool A', 'Pool B', 'Pool C', 'Pool D'][poolId];
 
         console.log(chalk.cyan(`[Acc ${idx + 1}] Governance vote ${i + 1}/5: Round ${ROUND_ID}, ${poolName}...`));
@@ -862,9 +868,8 @@ async function processGovernanceVote(account, idx) {
                 if (reason.includes('already') || reason.includes('voted')) {
                     return 'already_voted';
                 }
-                // Custom contract error (e.g., no vault deposit, not registered)
                 if (simErr.data || reason.includes('revert') || reason.includes('CALL_EXCEPTION')) {
-                    console.log(chalk.yellow(`[Acc ${idx + 1}] Gov vote rejected: ${reason.slice(0, 80)} (may need vault deposit first)`));
+                    console.log(chalk.yellow(`[Acc ${idx + 1}] Gov vote ${poolName} rejected: ${reason.slice(0, 80)}`));
                     return 'not_eligible';
                 }
                 throw simErr;
@@ -889,23 +894,26 @@ async function processGovernanceVote(account, idx) {
 
         if (result.success) {
             if (result.result === 'already_voted') {
-                console.log(chalk.yellow(`[Acc ${idx + 1}] Already voted this round/pool combo`));
+                console.log(chalk.yellow(`[Acc ${idx + 1}] Already voted ${poolName} this round`));
             } else if (result.result === 'not_eligible') {
-                console.log(chalk.yellow(`[Acc ${idx + 1}] Not eligible to vote yet, skipping governance`));
-                break;
+                notEligibleCount++;
+                // Don't break! Try all pools — some may work
+                if (notEligibleCount >= 3) {
+                    console.log(chalk.yellow(`[Acc ${idx + 1}] Not eligible for any pool, skipping rest`));
+                    break;
+                }
             } else {
                 voteCount++;
             }
         } else {
-            console.log(chalk.yellow(`[Acc ${idx + 1}] Vote ${i + 1} failed, stopping`));
-            break;
+            console.log(chalk.yellow(`[Acc ${idx + 1}] Vote ${i + 1} failed`));
         }
 
         await randomSleep();
     }
 
-    // Verify governance tasks
-    const govTasks = ['first-vote', 'active-voter', 'multi-voter', 'daily-activist'];
+    // Verify governance tasks (covers all badge types)
+    const govTasks = ['first-vote', 'active-voter', 'multi-voter', 'triple-voter', 'daily-activist', 'voting-streak', 'voting-spree', 'governance-whale'];
     for (const taskId of govTasks) {
         try {
             await client.post('/functions/v1/verify-onchain-task', {
@@ -956,15 +964,7 @@ async function processDailyTasks(account, idx) {
     } catch { }
     renderDashboard();
 
-    // 2. Web Faucet Claims
-    const usdcResult = await claimWebFaucet(wallet, USDC_ADDR, idx);
-    await randomSleep();
-    const usdtResult = await claimWebFaucet(wallet, USDT_ADDR, idx);
-
-    state[idx].webFaucet = (usdcResult.success || usdtResult.success) ? '✅' : '⏳CD';
-    renderDashboard();
-
-    // 3. Daily Check-in (S1 - uses dedicated s1-checkin endpoint)
+    // 2. Daily Check-in FIRST (critical for streak badges: Week Warrior, Bi-Weekly Hero, etc.)
     const checkinResult = await withRetry(async () => {
         const res = await client.post('/functions/v1/s1-checkin', {}, {
             headers: { 'x-wallet-address': addressLower }
@@ -977,6 +977,14 @@ async function processDailyTasks(account, idx) {
     }, idx, 'dailyTask');
 
     await randomSleep();
+
+    // 3. Web Faucet Claims (get tokens for deposits)
+    const usdcResult = await claimWebFaucet(wallet, USDC_ADDR, idx);
+    await randomSleep();
+    const usdtResult = await claimWebFaucet(wallet, USDT_ADDR, idx);
+
+    state[idx].webFaucet = (usdcResult.success || usdtResult.success) ? '✅' : '⏳CD';
+    renderDashboard();
 
     // ========== STEP 4: Deposit to RLP Vault (/vault) - THIS IS FOR DAILY TASK VERIFICATION ==========
     // Based on verify.har: task_id = "daily-deposit-tusdt-1000" and "daily-deposit-tusdc-1000"
